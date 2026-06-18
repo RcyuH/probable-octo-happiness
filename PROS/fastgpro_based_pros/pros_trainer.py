@@ -25,7 +25,9 @@ class EncodedPrompt:
     item: int
     ancestor_item: int
     question: str
-    answer: str
+    answer: Optional[str]
+    example: Dict[str, Any]
+    task_id: str
     prompt_ids: List[int]
     partial_rollout: List[int]
     input_ids: List[int]
@@ -47,6 +49,8 @@ class TrainingRecord:
     new_token_mask: List[int]
     reward: float
     decoded_completion: str
+    task_id: str
+    reward_example: Dict[str, Any]
     advantage: float = 0.0
     old_log_prob: Any = None
     ref_log_prob: Any = None
@@ -63,6 +67,8 @@ class ProsTrainer:
 
     def __init__(self, config: ProsConfig):
         self.cfg = config
+        if config.generation_backend not in {"speculative", "target"}:
+            raise ValueError(f"generation_backend must be 'speculative' or 'target', got {config.generation_backend!r}")
         self.repo_root = Path(__file__).resolve().parents[2]
         self.fastgrpo_root = self.repo_root / "FastGRPO"
         self._ensure_fastgrpo_importable()
@@ -73,8 +79,8 @@ class ProsTrainer:
 
         self._load_fastgrpo_helpers()
         self._load_models()
-        self.qas = self.get_train_QAs(config.train_option)
-        self.eval_qas = self.get_test_QAs(config.eval_option) if config.eval_option else []
+        self.qas = self._load_training_examples()
+        self.eval_qas = self._load_eval_examples()
         self.tree = ProsTreeEngine(len(self.qas), self._tree_config())
         self.next_items, self.last_sampler_metrics = self.tree.select_batch(config.batch_size, step_num=0)
 
@@ -83,12 +89,15 @@ class ProsTrainer:
             lr=config.target_lr,
         )
         self.optimizer_draft = (
-            self.torch.optim.AdamW(self.model.draft_model.parameters(), lr=config.draft_lr) if config.train_draft else None
+            self.torch.optim.AdamW(self.model.draft_model.parameters(), lr=config.draft_lr)
+            if config.train_draft and config.generation_backend == "speculative"
+            else None
         )
         self.target_accumulated_steps = 0
         self.draft_accumulated_steps = 0
         self.global_step = 0
         self.used_groups = 0
+        self.task_stats: Dict[str, Dict[str, float]] = {}
         self.start_time = time.time()
 
         self._prepare_output_dirs()
@@ -118,7 +127,11 @@ class ProsTrainer:
             generation_start = time.time()
             outputs = self._generate(prompts)
             records = self._build_training_records(prompts, outputs)
-            if self.cfg.train_draft and self.optimizer_draft is not None:
+            if (
+                self.cfg.train_draft
+                and self.cfg.generation_backend == "speculative"
+                and self.optimizer_draft is not None
+            ):
                 draft_metrics = self._train_draft_model(outputs, prompts)
             else:
                 draft_metrics = {}
@@ -162,6 +175,8 @@ class ProsTrainer:
                 "reward_std": float(np.std(reward_values)) if reward_values else 0.0,
                 "generated_len_mean": float(np.mean(token_lengths)) if token_lengths else 0.0,
                 "generated_len_std": float(np.std(token_lengths)) if len(token_lengths) > 1 else 0.0,
+                "generation_backend": self.cfg.generation_backend,
+                "task_metrics": self._summarize_task_stats(),
                 **self.last_sampler_metrics,
                 **tree_metrics,
                 **train_metrics,
@@ -191,15 +206,58 @@ class ProsTrainer:
     def _load_fastgrpo_helpers(self) -> None:
         from helper.get_QAs import get_test_QAs, get_train_QAs
         from helper.modeling_draft import Model
+        from helper.multitask import (
+            compute_multitask_reward,
+            load_multitask_QAs,
+            normalize_single_task_QAs,
+            render_messages,
+        )
         from helper.rewards import accuracy_reward_func, format_reward_func
         from helper.specualtive_generate import speculative_generate
 
         self.Model = Model
         self.get_train_QAs = get_train_QAs
         self.get_test_QAs = get_test_QAs
+        self.compute_multitask_reward = compute_multitask_reward
+        self.load_multitask_QAs = load_multitask_QAs
+        self.normalize_single_task_QAs = normalize_single_task_QAs
+        self.render_messages = render_messages
         self.accuracy_reward_func = accuracy_reward_func
         self.format_reward_func = format_reward_func
         self.speculative_generate = speculative_generate
+
+    def _load_training_examples(self) -> List[Dict[str, Any]]:
+        if self.cfg.task_config:
+            samples_per_epoch = self.cfg.task_samples_per_epoch or None
+            return self.load_multitask_QAs(
+                self.cfg.task_config,
+                split=self.cfg.task_split,
+                samples_per_epoch=samples_per_epoch,
+                seed=self.cfg.seed,
+            )
+        return self.normalize_single_task_QAs(
+            self.get_train_QAs(self.cfg.train_option),
+            task_id=self.cfg.train_option,
+            prompt_type="math",
+            reward_type="math_latex",
+        )
+
+    def _load_eval_examples(self) -> List[Dict[str, Any]]:
+        if self.cfg.eval_task_config:
+            return self.load_multitask_QAs(
+                self.cfg.eval_task_config,
+                split=self.cfg.eval_task_split,
+                samples_per_epoch=self.cfg.eval_samples or None,
+                seed=self.cfg.seed,
+            )
+        if self.cfg.eval_option:
+            return self.normalize_single_task_QAs(
+                self.get_test_QAs(self.cfg.eval_option),
+                task_id=self.cfg.eval_option,
+                prompt_type="math",
+                reward_type="math_latex",
+            )
+        return []
 
     def _load_models(self) -> None:
         if not self.cfg.model_dir:
@@ -302,7 +360,7 @@ class ProsTrainer:
             node = self.tree.get_node(int(item))
             ancestor = self.tree.get_original_ancestor_item(int(item))
             qa = self.qas[ancestor]
-            prompt_ids = self._encode_base_prompt(qa["question"])
+            prompt_ids = self._encode_base_prompt(qa)
             partial = node.partial_rollout or []
             input_ids = prompt_ids + partial
             if len(input_ids) >= self.cfg.max_length:
@@ -311,8 +369,10 @@ class ProsTrainer:
                 EncodedPrompt(
                     item=int(item),
                     ancestor_item=ancestor,
-                    question=qa["question"],
-                    answer=qa["answer"],
+                    question=qa.get("question") or qa.get("prompt") or qa.get("instruction") or "",
+                    answer=qa.get("answer"),
+                    example=qa,
+                    task_id=qa.get("task_id", "default"),
                     prompt_ids=prompt_ids,
                     partial_rollout=partial,
                     input_ids=input_ids,
@@ -320,18 +380,9 @@ class ProsTrainer:
             )
         return prompts
 
-    def _encode_base_prompt(self, question: str) -> List[int]:
-        system_prompt = "You are a math problem assistant."
-        user_prompt = (
-            "Below is an instruction that describes a task, paired with an input that provides further context.\n"
-            "Write a response that appropriately completes the request.\n"
-            "Your response should include your thought process enclosed within <think></think> tags\n"
-            "and the final answer enclosed within <answer></answer> tags (Just put a number between the tags).\n\n"
-            f"### Instruction:\n{question}\n"
-            "Please reason step by step, and put your final answer within \\boxed{}"
-        )
+    def _encode_base_prompt(self, example: Dict[str, Any]) -> List[int]:
         text = self.tokenizer.apply_chat_template(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            self.render_messages(example),
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -373,6 +424,18 @@ class ProsTrainer:
         input_ids, attention_mask = self._pad_left([prompt.input_ids for prompt in prompts])
         statistical_time = bool(self.torch.cuda.is_available())
         top_k = self.cfg.top_k if self.cfg.top_k > 0 else None
+        if self.cfg.generation_backend == "target":
+            return self._target_generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                do_sample=True,
+                repeated_generate_nums=self.cfg.repeated_generate_nums,
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
+                top_k=top_k,
+                statistical_time=statistical_time,
+                max_length=self.cfg.max_length,
+            )
         with self.torch.inference_mode():
             return self.speculative_generate(
                 model=self.model,
@@ -389,72 +452,196 @@ class ProsTrainer:
                 statistical_time=statistical_time,
             )
 
+    def _target_generate(
+        self,
+        input_ids,
+        attention_mask,
+        *,
+        do_sample: bool,
+        repeated_generate_nums: int,
+        temperature: float,
+        top_p: float,
+        top_k: Optional[int],
+        statistical_time: bool,
+        max_length: int,
+    ) -> Dict[str, Any]:
+        start_time = time.time()
+        repeated_nums = repeated_generate_nums or 1
+        prompt_length = input_ids.shape[-1]
+        max_new_tokens = max(max_length - prompt_length, 1)
+        expanded_input_ids = input_ids.to(self.device).repeat_interleave(repeated_nums, dim=0)
+        expanded_attention_mask = attention_mask.to(self.device).repeat_interleave(repeated_nums, dim=0)
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+
+        generation_kwargs = {
+            "input_ids": expanded_input_ids,
+            "attention_mask": expanded_attention_mask,
+            "do_sample": do_sample,
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if do_sample:
+            generation_kwargs["temperature"] = temperature
+            generation_kwargs["top_p"] = top_p
+            if top_k is not None:
+                generation_kwargs["top_k"] = top_k
+
+        target_time_start = time.time()
+        with self.torch.inference_mode():
+            output_ids = self.model.target_model.generate(**generation_kwargs)
+        if self.torch.cuda.is_available():
+            self.torch.cuda.synchronize()
+        target_time_cost = time.time() - target_time_start
+
+        generated_token_ids = []
+        for sequence in output_ids:
+            completion = sequence[prompt_length:].detach().cpu().tolist()
+            trimmed = []
+            for token in completion:
+                if pad_token_id is not None and token == pad_token_id:
+                    continue
+                trimmed.append(token)
+                if self.tokenizer.eos_token_id is not None and token == self.tokenizer.eos_token_id:
+                    break
+            generated_token_ids.append(trimmed)
+
+        total_decoded_token_num = sum(len(item) for item in generated_token_ids)
+        max_sequence_length = max((len(item) for item in generated_token_ids), default=0)
+        total_time_cost = time.time() - start_time
+        return {
+            "generated_token_ids": generated_token_ids,
+            "max_sequence_length": max_sequence_length,
+            "total_acc_length": total_decoded_token_num,
+            "total_acc": 1.0,
+            "total_decoded_token_num": max(total_decoded_token_num, 1),
+            "total_time_cost": total_time_cost,
+            "target_time_cost": target_time_cost,
+            "draft_time_cost": 0.0,
+            "check_time_cost": 0.0,
+            "prefill_time_cost": 0.0,
+            "post_time_cost": total_time_cost - target_time_cost,
+            "all_draft_input_states": None,
+            "all_draft_input_ids": None,
+        }
+
+    def _get_task_stat(self, task_id: str) -> Dict[str, float]:
+        if task_id not in self.task_stats:
+            self.task_stats[task_id] = {
+                "used_items": 0.0,
+                "reward_sum": 0.0,
+                "reward_count": 0.0,
+                "generated_length_sum": 0.0,
+                "generated_completion_count": 0.0,
+                "ignore_due_correct": 0.0,
+                "ignore_due_incorrect": 0.0,
+            }
+        return self.task_stats[task_id]
+
+    def _summarize_task_stats(self) -> Dict[str, Dict[str, float]]:
+        summary: Dict[str, Dict[str, float]] = {}
+        for task_id, stats in self.task_stats.items():
+            reward_count = stats["reward_count"]
+            completion_count = stats["generated_completion_count"]
+            summary[task_id] = {
+                "used_items": int(stats["used_items"]),
+                "mean_reward": round(stats["reward_sum"] / reward_count, 4) if reward_count else 0.0,
+                "mean_length": round(stats["generated_length_sum"] / completion_count, 3) if completion_count else 0.0,
+                "generated_completions": int(completion_count),
+                "ignore_due_correct": int(stats["ignore_due_correct"]),
+                "ignore_due_incorrect": int(stats["ignore_due_incorrect"]),
+            }
+        return summary
+
     def _evaluate(self) -> Dict[str, float]:
         eval_examples = self.eval_qas[: self.cfg.eval_samples]
         if not eval_examples:
             return {}
 
         self.model.target_model.eval()
-        prompts = [
-            EncodedPrompt(
-                item=i,
-                ancestor_item=i,
-                question=example["question"],
-                answer=example["answer"],
-                prompt_ids=self._encode_base_prompt(example["question"]),
-                partial_rollout=[],
-                input_ids=self._encode_base_prompt(example["question"]),
+        prompts = []
+        for i, example in enumerate(eval_examples):
+            prompt_ids = self._encode_base_prompt(example)
+            prompts.append(
+                EncodedPrompt(
+                    item=i,
+                    ancestor_item=i,
+                    question=example.get("question") or example.get("prompt") or example.get("instruction") or "",
+                    answer=example.get("answer"),
+                    example=example,
+                    task_id=example.get("task_id", "default"),
+                    prompt_ids=prompt_ids,
+                    partial_rollout=[],
+                    input_ids=prompt_ids,
+                )
             )
-            for i, example in enumerate(eval_examples)
-        ]
         rewards: List[float] = []
         accuracies: List[float] = []
+        task_rewards: Dict[str, List[float]] = {}
         for start in range(0, len(prompts), self.cfg.batch_size):
             batch_prompts = prompts[start : start + self.cfg.batch_size]
             input_ids, attention_mask = self._pad_left([prompt.input_ids for prompt in batch_prompts])
             with self.torch.inference_mode():
-                outputs = self.speculative_generate(
-                    model=self.model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    tokenizer=self.tokenizer,
-                    do_sample=True,
-                    max_length=self.cfg.max_length,
-                    repeated_generate_nums=1,
-                    temperature=self.cfg.temperature,
-                    top_p=self.cfg.top_p,
-                    top_k=self.cfg.top_k if self.cfg.top_k > 0 else None,
-                    return_all_draft_input=False,
-                    statistical_time=bool(self.torch.cuda.is_available()),
-                )
+                top_k = self.cfg.top_k if self.cfg.top_k > 0 else None
+                if self.cfg.generation_backend == "target":
+                    outputs = self._target_generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        do_sample=True,
+                        max_length=self.cfg.max_length,
+                        repeated_generate_nums=1,
+                        temperature=self.cfg.temperature,
+                        top_p=self.cfg.top_p,
+                        top_k=top_k,
+                        statistical_time=bool(self.torch.cuda.is_available()),
+                    )
+                else:
+                    outputs = self.speculative_generate(
+                        model=self.model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        tokenizer=self.tokenizer,
+                        do_sample=True,
+                        max_length=self.cfg.max_length,
+                        repeated_generate_nums=1,
+                        temperature=self.cfg.temperature,
+                        top_p=self.cfg.top_p,
+                        top_k=top_k,
+                        return_all_draft_input=False,
+                        statistical_time=bool(self.torch.cuda.is_available()),
+                    )
             for prompt, generated_ids in zip(batch_prompts, outputs["generated_token_ids"]):
                 completion = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-                format_reward = self.format_reward_func([completion])[0]
-                answer_reward = self.accuracy_reward_func([completion], [prompt.answer])[0]
-                rewards.append(float(0.2 * format_reward + answer_reward))
-                accuracies.append(float(answer_reward))
+                reward = float(self.compute_multitask_reward(completion, prompt.example))
+                rewards.append(reward)
+                accuracies.append(reward)
+                task_rewards.setdefault(prompt.task_id, []).append(reward)
         return {
             "eval/reward_mean": float(np.mean(rewards)) if rewards else 0.0,
             "eval/accuracy_mean": float(np.mean(accuracies)) if accuracies else 0.0,
             "eval/samples": float(len(rewards)),
+            "eval/task_reward_mean": {
+                task_id: float(np.mean(values)) if values else 0.0 for task_id, values in task_rewards.items()
+            },
         }
 
     def _build_training_records(self, prompts: Sequence[EncodedPrompt], outputs: Dict[str, Any]) -> List[TrainingRecord]:
         generated = outputs["generated_token_ids"]
-        decoded_by_sample = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in generated]
         prompt_records: Dict[int, List[TrainingRecord]] = {}
+        repeat_count = self.cfg.repeated_generate_nums or 1
 
         for idx, generated_ids in enumerate(generated):
-            prompt_idx = idx // self.cfg.repeated_generate_nums
+            prompt_idx = idx // repeat_count
             prompt = prompts[prompt_idx]
             generated_ids = list(generated_ids)
             if not generated_ids:
                 continue
             full_response_ids = prompt.partial_rollout + generated_ids
             decoded_completion = self.tokenizer.decode(full_response_ids, skip_special_tokens=True)
-            format_reward = self.format_reward_func([decoded_completion])[0]
-            answer_reward = self.accuracy_reward_func([decoded_completion], [prompt.answer])[0]
-            reward = float(0.2 * format_reward + answer_reward)
+            reward = float(self.compute_multitask_reward(decoded_completion, prompt.example))
             full_input_ids = prompt.prompt_ids + full_response_ids
             new_token_mask = [0] * (len(prompt.prompt_ids) + len(prompt.partial_rollout)) + [1] * len(generated_ids)
             if len(full_input_ids) != len(new_token_mask):
@@ -471,17 +658,28 @@ class ProsTrainer:
                     new_token_mask=new_token_mask,
                     reward=reward,
                     decoded_completion=decoded_completion,
+                    task_id=prompt.task_id,
+                    reward_example=prompt.example,
                 )
             )
 
         records: List[TrainingRecord] = []
         for group in prompt_records.values():
             rewards = [record.reward for record in group]
+            task_id = group[0].task_id if group else "default"
+            task_stat = self._get_task_stat(task_id)
+            task_stat["generated_length_sum"] += float(sum(len(record.generated_ids) for record in group))
+            task_stat["generated_completion_count"] += float(len(group))
             if self.cfg.drop_zero_std_groups and len(group) > 1 and float(np.std(rewards)) == 0.0:
                 if rewards and rewards[0] >= self.cfg.tree_score_threshold:
-                    pass
+                    task_stat["ignore_due_correct"] += 1.0
+                else:
+                    task_stat["ignore_due_incorrect"] += 1.0
                 continue
             records.extend(group)
+            task_stat["used_items"] += 1.0
+            task_stat["reward_sum"] += float(sum(rewards))
+            task_stat["reward_count"] += float(len(rewards))
             self.used_groups += 1
         return records
 
@@ -646,7 +844,8 @@ class ProsTrainer:
         if not states or not ids:
             return {"draft/loss1": 0.0, "draft/loss2": 0.0}
 
-        prompt_lens = [len(prompts[idx // self.cfg.repeated_generate_nums].input_ids) for idx in range(len(states))]
+        repeat_count = self.cfg.repeated_generate_nums or 1
+        prompt_lens = [len(prompts[idx // repeat_count].input_ids) for idx in range(len(states))]
         pairs = sorted(zip(ids, states, prompt_lens), key=lambda x: x[0].shape[-1])
 
         total_loss1 = 0.0
@@ -769,5 +968,5 @@ class ProsTrainer:
         draft_path.parent.mkdir(parents=True, exist_ok=True)
         self.model.target_model.save_pretrained(target_dir)
         self.tokenizer.save_pretrained(target_dir)
-        if hasattr(self.model, "save_model"):
+        if self.cfg.generation_backend == "speculative" and hasattr(self.model, "save_model"):
             self.model.save_model(str(draft_path))

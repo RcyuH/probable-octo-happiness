@@ -19,6 +19,7 @@ The implementation lives under the intentionally spelled target path:
 | `core_algos.py::compute_policy_loss` | verl clipped GRPO loss | `pros_loss.py::compute_clipped_grpo_policy_loss` | Reimplemented |
 | `core_algos.py::compute_policy_loss_gpg` | GPG policy loss | `pros_loss.py::compute_gpg_policy_loss` | Reimplemented |
 | `FastGRPO/grpo_speculative.py::compute_target_loss` | FastGRPO PPO-style target loss with optional reference KL | `pros_loss.py::compute_fastgrpo_policy_loss` | Reimplemented and used by default for FastGRPO-fair runs |
+| `FastGRPO/helper/multitask.py` | Multi-task dataset loading, prompt rendering, and reward dispatch | `pros_trainer.py` imports `load_multitask_QAs`, `normalize_single_task_QAs`, `render_messages`, `compute_multitask_reward` | Reused |
 | `FastGRPO/helper/*` | Model wrapper, speculative generation, math rewards, datasets | `pros_trainer.py` imports these helpers | Reused |
 
 ## What Was Ported
@@ -29,6 +30,8 @@ The implementation lives under the intentionally spelled target path:
 - Partial-rollout loss masking.
 - GRPO and GPG advantage computation.
 - FastGRPO-compatible target loss, reward calls, speculative generation, LoRA target loading, draft model wrapper, logging, and checkpoint output.
+- FastGRPO-compatible multi-task/multi-reward RLVR mode through `task_config`.
+- FastGRPO-compatible `generation_backend` mode: `speculative` or target-only `target`.
 
 ## Important Deviations
 
@@ -63,6 +66,36 @@ Equivalent shell wrapper:
 ```bash
 bash PROS/fastgpro_based_pros/scripts/run_pros.sh
 ```
+
+## Multi-Task / Multi-Reward PROS
+
+The PROS trainer accepts the same task JSON used by FastGRPO:
+
+```bash
+python3 PROS/fastgpro_based_pros/train_pros.py \
+  --config PROS/fastgpro_based_pros/configs/pros_multitask_fastgrpo_example.json \
+  --task-config FastGRPO/configs/multitask_rlvr.example.json \
+  --generation-backend speculative
+```
+
+Target-only PROS baseline with the same task/reward harness:
+
+```bash
+python3 PROS/fastgpro_based_pros/train_pros.py \
+  --config PROS/fastgpro_based_pros/configs/pros_multitask_fastgrpo_example.json \
+  --generation-backend target \
+  --train-draft false \
+  --output-dir outputs/pros_multitask_target \
+  --log-file outputs/pros_multitask_target/train.jsonl \
+  --saved-model-dir outputs/pros_multitask_target/target \
+  --saved-draft-model-dir outputs/pros_multitask_target/draft \
+  --saved-statistics-dir outputs/pros_multitask_target/statistics
+```
+
+Supported reward types are inherited from FastGRPO: `math_latex`,
+`exact_match`, `contains`, `regex`, `format_only`, `zero`, and custom reward
+callables through `custom_reward_func`. Logs include `generation_backend` and
+`task_metrics`.
 
 Use these knobs for the closest original-PROS behavior:
 
@@ -113,6 +146,32 @@ python3 FastGRPO/grpo_speculative.py \
   --saved_statistics_dir outputs/fastgrpo_baseline/statistics
 ```
 
+For multi-task comparisons, use the same task config on both sides:
+
+```bash
+python3 FastGRPO/grpo_speculative.py \
+  --model_dir "$MODEL_DIR" \
+  --adapter_path "$DRAFT_ADAPTER_PATH" \
+  --task_config FastGRPO/configs/multitask_rlvr.example.json \
+  --generation_backend speculative \
+  --model_type qwen2 \
+  --version_name multitask_fastgrpo \
+  --batch_size 4 \
+  --num_epochs 1 \
+  --repeated_generate_nums 8 \
+  --is_train_draft True \
+  --log_file outputs/fastgrpo_multitask/train.log \
+  --saved_model_dir outputs/fastgrpo_multitask/target \
+  --saved_draft_model_dir outputs/fastgrpo_multitask/draft \
+  --saved_statistics_dir outputs/fastgrpo_multitask/statistics
+
+python3 PROS/fastgpro_based_pros/train_pros.py \
+  --config PROS/fastgpro_based_pros/configs/pros_multitask_fastgrpo_example.json \
+  --model-dir "$MODEL_DIR" \
+  --adapter-path "$DRAFT_ADAPTER_PATH" \
+  --task-config FastGRPO/configs/multitask_rlvr.example.json
+```
+
 Then run PROS with matching shared settings:
 
 ```bash
@@ -122,4 +181,3 @@ python3 PROS/fastgpro_based_pros/train_pros.py \
   --adapter-path "$DRAFT_ADAPTER_PATH" \
   --output-dir outputs/pros_fastgrpo
 ```
-

@@ -48,6 +48,11 @@ class ProsConfig:
     model_type: str = "qwen2"
     train_option: str = "simplelr_abel_level3to5"
     eval_option: str = ""
+    task_config: str = ""
+    task_split: str = "train"
+    task_samples_per_epoch: int = 0
+    eval_task_config: str = ""
+    eval_task_split: str = "test"
 
     # Output locations.
     output_dir: str = "outputs/pros_fastgrpo"
@@ -76,6 +81,7 @@ class ProsConfig:
     temperature: float = 1.0
     top_p: float = 0.95
     top_k: int = 0
+    generation_backend: str = "speculative"  # speculative, target
     beta: float = 0.0
     epsilon: float = 0.1
 
