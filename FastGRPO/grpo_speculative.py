@@ -2,7 +2,6 @@ import os
 import pandas as pd
 from transformers import AutoTokenizer,AutoConfig,AutoModelForCausalLM,GenerationConfig
 from helper.modeling_draft import Model
-from helper.rewards import accuracy_reward_func , format_reward_func
 from helper.get_QAs import get_test_QAs , get_train_QAs
 from helper.specualtive_generate import speculative_generate
 import torch
@@ -17,12 +16,19 @@ import pandas as pd
 import signal
 import sys
 import torch
+import random
 from copy import deepcopy
 from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftType
 from datetime import datetime
 import argparse 
 from statistics import mean , stdev
 import pickle
+from helper.multitask import (
+    compute_multitask_reward,
+    load_multitask_QAs,
+    normalize_single_task_QAs,
+    render_messages,
+)
 
 def handle_signal(signum, frame):
     print("Received signal, cleaning up...")
@@ -48,6 +54,16 @@ parser.add_argument('--draft_lr', type=float, default=1e-4, help='Learning rate 
 parser.add_argument('--is_train_draft', type=lambda x: x.lower() == 'true', default=True, help='Whether to train the draft model (True/False)')
 parser.add_argument('--model_type', type=str, default='Qwen2___5-Math-7B', help='Version name for saving checkpoints')
 parser.add_argument('--train_option',type=str,default="simplelr_abel_level3to5")
+parser.add_argument('--task_config', type=str, default="",
+                    help="Optional JSON config for multi-task RLVR datasets.")
+parser.add_argument('--task_split', type=str, default="train",
+                    help="Dataset split to load from task_config.")
+parser.add_argument('--task_samples_per_epoch', type=int, default=None,
+                    help="Optional total mixed samples per epoch for weighted task configs.")
+parser.add_argument('--seed', type=int, default=42)
+parser.add_argument('--generation_backend', type=str, default="speculative",
+                    choices=["speculative", "target"],
+                    help="Use FastGRPO speculative generation or target-only generation baseline.")
 parser.add_argument('--load_lora_path',type=str,default="")
 parser.add_argument('--batch_size',type=int,default=4)
 parser.add_argument('--version_name',type=str,default='normal')
@@ -94,6 +110,17 @@ log_file = args.log_file
 saved_model_dir = args.saved_model_dir
 saved_draft_model_dir = args.saved_draft_model_dir
 saved_statistics_dir = args.saved_statistics_dir
+task_config = args.task_config
+task_split = args.task_split
+task_samples_per_epoch = args.task_samples_per_epoch
+seed = args.seed
+generation_backend = args.generation_backend
+
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
 
 if not os.path.exists(saved_model_dir):
     os.makedirs(saved_model_dir)
@@ -116,6 +143,8 @@ print(f"LR: target={target_lr}, draft={draft_lr} | "
       f"Seq: max_len={max_length}, max_tokens={max_training_token}, pad_gap={max_training_padding_gap}")
 print(f"Gen: temp={temperature}, top_p={top_p}"
       f"beta={beta}, epsilon={epsilon}")
+print(f"Generation backend: {generation_backend}")
+print(f"Task config: {task_config if task_config else args.train_option}")
 print(f"Draft: train={is_train_draft}")
 print(f"Iteration: grpo_iter={grpo_iteration_num}, sample={sample_num}, "
       f"repeat_gen={repeated_generate_nums}")
@@ -141,7 +170,21 @@ if config.model_type == 'llama':
     tokenizer.pad_token_id = 128001
     
 
-QAs = get_train_QAs(args.train_option)
+if task_config:
+    QAs = load_multitask_QAs(
+        task_config,
+        split=task_split,
+        samples_per_epoch=task_samples_per_epoch,
+        seed=seed,
+    )
+else:
+    QAs = normalize_single_task_QAs(
+        get_train_QAs(args.train_option),
+        task_id=args.train_option,
+        prompt_type="math",
+        reward_type="math_latex",
+    )
+print(f"Loaded {len(QAs)} training samples")
 df = pd.DataFrame(QAs)
 
 for param in model.draft_model.parameters():
@@ -423,6 +466,107 @@ def training_draft_model(model,outputs,prompt_mask):
     
     return total_loss1,total_loss2
 
+
+def target_generate(model, input_ids, attention_mask, tokenizer,
+                    do_sample=False, repeated_generate_nums=None,
+                    temperature=0.8, top_p=0.9, top_k=None,
+                    statistical_time=True, max_length=2048):
+    """Target-model generation baseline with the same output shape as speculative_generate."""
+    start_time = time.time()
+    device = model.target_model.device
+    repeated_nums = repeated_generate_nums or 1
+    prompt_length = input_ids.shape[-1]
+    max_new_tokens = max(max_length - prompt_length, 1)
+
+    expanded_input_ids = input_ids.to(device).repeat_interleave(repeated_nums, dim=0)
+    expanded_attention_mask = attention_mask.to(device).repeat_interleave(repeated_nums, dim=0)
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+
+    generation_kwargs = {
+        "input_ids": expanded_input_ids,
+        "attention_mask": expanded_attention_mask,
+        "do_sample": do_sample,
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    if do_sample:
+        generation_kwargs["temperature"] = temperature
+        generation_kwargs["top_p"] = top_p
+        if top_k is not None:
+            generation_kwargs["top_k"] = top_k
+
+    target_time_start = time.time()
+    output_ids = model.target_model.generate(**generation_kwargs)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    target_time_cost = time.time() - target_time_start
+
+    generated_token_ids = []
+    for sequence in output_ids:
+        completion = sequence[prompt_length:].detach().cpu().tolist()
+        trimmed = []
+        for token in completion:
+            if pad_token_id is not None and token == pad_token_id:
+                continue
+            trimmed.append(token)
+            if tokenizer.eos_token_id is not None and token == tokenizer.eos_token_id:
+                break
+        generated_token_ids.append(trimmed)
+
+    total_decoded_token_num = sum(len(item) for item in generated_token_ids)
+    max_sequence_length = max((len(item) for item in generated_token_ids), default=0)
+    total_time_cost = time.time() - start_time
+
+    return {
+        "generated_token_ids": generated_token_ids,
+        "max_sequence_length": max_sequence_length,
+        "total_acc_length": total_decoded_token_num,
+        "total_acc": 1.0,
+        "total_decoded_token_num": max(total_decoded_token_num, 1),
+        "total_time_cost": total_time_cost,
+        "target_time_cost": target_time_cost,
+        "draft_time_cost": 0,
+        "check_time_cost": 0,
+        "prefill_time_cost": 0,
+        "post_time_cost": total_time_cost - target_time_cost,
+        "all_draft_input_states": None,
+        "all_draft_input_ids": None,
+    }
+
+
+def _get_task_stat(task_stats, task_id):
+    if task_id not in task_stats:
+        task_stats[task_id] = {
+            "used_items": 0,
+            "reward_sum": 0.0,
+            "reward_count": 0,
+            "generated_length_sum": 0.0,
+            "generated_completion_count": 0,
+            "ignore_due_correct": 0,
+            "ignore_due_incorrect": 0,
+        }
+    return task_stats[task_id]
+
+
+def _summarize_task_stats(task_stats):
+    summary = {}
+    for task_id, stats in task_stats.items():
+        reward_count = stats["reward_count"]
+        completion_count = stats["generated_completion_count"]
+        summary[task_id] = {
+            "used_items": stats["used_items"],
+            "mean_reward": round(stats["reward_sum"] / reward_count, 4) if reward_count else 0,
+            "mean_length": round(stats["generated_length_sum"] / completion_count, 3) if completion_count else 0,
+            "generated_completions": completion_count,
+            "ignore_due_correct": stats["ignore_due_correct"],
+            "ignore_due_incorrect": stats["ignore_due_incorrect"],
+        }
+    return summary
+
         
 optimizer_target = torch.optim.AdamW(model.target_model.parameters(), lr=target_lr)
 optimizer_draft = torch.optim.AdamW(model.draft_model.parameters(), lr=draft_lr)
@@ -439,6 +583,7 @@ batch_data={
     'messages':[],
     'rewards':[],
     'std_rewards':[],
+    'task_ids':[],
     'generate_time_cost':0,
     'last_generate_time_cost':[],
     'train_time_cost':0,
@@ -460,7 +605,8 @@ batch_data={
     'draft_train_time_cost':0,
     'last_draft_loss1':[],
     'last_draft_loss2':[] ,
-    'generate_length_list':[] 
+    'generate_length_list':[],
+    'task_stats':{},
 }
 
 optimizer_target.zero_grad(set_to_none=True)
@@ -473,21 +619,16 @@ class TrainDataCollator:
         self.tokenizer = tokenizer
     
     def __call__(self, batch):
-        system_prompt = "You are a math problem assistant." 
-        user_prompt =  '''Below is an instruction that describes a task, paired with an input that provides further context.
-            Write a response that appropriately completes the request.
-            Your response should include your thought process enclosed within <think></think> tags
-            and the final answer enclosed within <answer></answer> tags (Just put a number between the tags).\n
-            ### Instruction:\n{instruction}\nPlease reason step by step, and put your final answer within \\boxed{{}}'''
         messages = []
         answers = []
+        reward_examples = []
+        task_ids = []
 
         for example in batch:
-            messages.append([
-                {"role" : "system" , "content": system_prompt} , 
-                {"role" : "user" , "content": user_prompt.format_map({"instruction" : example['question']}) }
-            ])
-            answers.append(example['answer'])
+            messages.append(render_messages(example))
+            answers.append(example.get('answer'))
+            reward_examples.append(example)
+            task_ids.append(example.get('task_id', 'default'))
         tokenized_inputs = self.tokenizer(
             text=self.tokenizer.apply_chat_template(messages,tokenize=False,add_generation_prompt=True),
             return_tensors='pt',padding='longest',truncation=True,max_length=4096,padding_side='left'         
@@ -497,7 +638,9 @@ class TrainDataCollator:
             'input_ids': tokenized_inputs['input_ids'],
             'attention_mask': tokenized_inputs['attention_mask'],
             'messages': messages,        
-            'answers': answers,           
+            'answers': answers,
+            'reward_examples': reward_examples,
+            'task_ids': task_ids,
         }
 
 dataloader=DataLoader(QAs,collate_fn=TrainDataCollator(tokenizer=tokenizer),num_workers=4,
@@ -517,32 +660,35 @@ for epoch in range(num_epochs):
             batch=[]
             continue
         
-        if None in batch['answers']:
-            batch=[]
-            continue
-        
         input_ids=batch['input_ids'].to('cuda')
         attention_mask=batch['attention_mask'].to('cuda')
         messages=batch['messages']
         answers=batch['answers']
+        reward_examples=batch['reward_examples']
+        task_ids=batch['task_ids']
         
         with torch.inference_mode():
-            outputs=speculative_generate(model=model,input_ids=input_ids,attention_mask=attention_mask,tokenizer=tokenizer,
-            do_sample=True,max_length=max_length,repeated_generate_nums=repeated_generate_nums,temperature=temperature,top_p=top_p,
-            return_all_draft_input=True,statistical_time=True)
+            if generation_backend == "speculative":
+                outputs=speculative_generate(model=model,input_ids=input_ids,attention_mask=attention_mask,tokenizer=tokenizer,
+                do_sample=True,max_length=max_length,repeated_generate_nums=repeated_generate_nums,temperature=temperature,top_p=top_p,
+                return_all_draft_input=True,statistical_time=True)
+            else:
+                outputs=target_generate(model=model,input_ids=input_ids,attention_mask=attention_mask,tokenizer=tokenizer,
+                do_sample=True,max_length=max_length,repeated_generate_nums=repeated_generate_nums,temperature=temperature,top_p=top_p,
+                statistical_time=True)
         
         prompt_length=input_ids.shape[-1]
         outputs['prompt_length']=prompt_length
         
         outputs['decoded_sequences']=[tokenizer.decode(x,skip_special_tokens=True) for x in outputs['generated_token_ids']]
         token_ids_length = [len(item) for item in outputs['generated_token_ids'] ]
-        length_stdev = stdev(token_ids_length)
+        length_stdev = stdev(token_ids_length) if len(token_ids_length) > 1 else 0.0
         length_range = max(token_ids_length) - min(token_ids_length)
-        length_cv = length_stdev / mean(token_ids_length) 
-        length_ave = mean(token_ids_length) 
+        length_ave = mean(token_ids_length) if len(token_ids_length) > 0 else 0
+        length_cv = length_stdev / length_ave if length_ave else 0
         batch_data['generate_length_list'].extend(token_ids_length)
         
-        if is_train_draft:
+        if is_train_draft and generation_backend == "speculative":
             torch.cuda.synchronize()
             draft_train_time_start=time.time()
             draft_loss1,draft_loss2=training_draft_model(model,outputs,attention_mask)
@@ -556,19 +702,25 @@ for epoch in range(num_epochs):
                 optimizer_draft.zero_grad(set_to_none=True)
                 draft_step += 1
     
-        if draft_step % 1024 == 0 and step > 0 and is_train_draft:
+        if draft_step % 1024 == 0 and step > 0 and is_train_draft and generation_backend == "speculative":
             with open(f"{saved_statistics_dir}/{step}.pkl","wb") as f:
                 pickle.dump(batch_data['generate_length_list'],f)
         
         generate_length=0
+        repeat_count = repeated_generate_nums or 1
         for idx_batch in range(len(answers)):
             generate_length += outputs['max_sequence_length']
             rewards=[]
             new_messages=[]
-            for idx_k in range(repeated_generate_nums):
-                idx_sequence=idx_batch*repeated_generate_nums+idx_k
+            task_id = task_ids[idx_batch]
+            reward_example = reward_examples[idx_batch]
+            task_stat = _get_task_stat(batch_data['task_stats'], task_id)
+            cur_lengths = []
+
+            for idx_k in range(repeat_count):
+                idx_sequence=idx_batch*repeat_count+idx_k
                 decoded_sequence=outputs['decoded_sequences'][idx_sequence]
-                ground_truth=answers[idx_batch]
+                cur_lengths.append(token_ids_length[idx_sequence])
                 
                 new_message=deepcopy(messages[idx_batch])
                 new_message.append({
@@ -576,12 +728,13 @@ for epoch in range(num_epochs):
                     "content":decoded_sequence
                 })
                 
-                format_reward=format_reward_func([decoded_sequence])
-                answer_reward=accuracy_reward_func([decoded_sequence],[ground_truth])
-                reward=0.2*format_reward[0]+answer_reward[0]
+                reward=compute_multitask_reward(decoded_sequence, reward_example)
                 
                 rewards.append(reward)
                 new_messages.append(new_message)
+
+            task_stat['generated_length_sum'] += sum(cur_lengths)
+            task_stat['generated_completion_count'] += len(cur_lengths)
             
             
             rewards=np.array(rewards) 
@@ -589,8 +742,10 @@ for epoch in range(num_epochs):
                 
                 if rewards[0]>=1.0:
                     batch_data['ignore_due_correct']+=1
+                    task_stat['ignore_due_correct']+=1
                 else:
                     batch_data['ignore_due_incorrect']+=1
+                    task_stat['ignore_due_incorrect']+=1
                     
                 continue
             
@@ -598,6 +753,10 @@ for epoch in range(num_epochs):
             batch_data['messages']+=new_messages
             batch_data['rewards']+=rewards.tolist()
             batch_data['std_rewards']+=std_rewards.tolist()
+            batch_data['task_ids'] += [task_id] * len(new_messages)
+            task_stat['used_items'] += 1
+            task_stat['reward_sum'] += float(rewards.sum())
+            task_stat['reward_count'] += len(rewards)
             used_items+=1
             
         generate_length /= len(answers)
@@ -637,14 +796,16 @@ for epoch in range(num_epochs):
         attention_mask=text.attention_mask
         
         sorted_pairs = sorted(
-            zip(input_ids, attention_mask, loss_mask),
+            zip(input_ids, attention_mask, loss_mask, batch_data['std_rewards'], batch_data['task_ids']),
             key=lambda x: len(x[0]),
             reverse=False   
         )
 
-        input_ids_sorted, attention_mask_sorted, loss_mask_sorted = zip(*sorted_pairs)
+        input_ids_sorted, attention_mask_sorted, loss_mask_sorted, rewards_sorted, task_ids_sorted = zip(*sorted_pairs)
 
         input_ids, attention_mask, loss_mask = list(input_ids_sorted), list(attention_mask_sorted), list(loss_mask_sorted)
+        batch_data['std_rewards'] = list(rewards_sorted)
+        batch_data['task_ids'] = list(task_ids_sorted)
 
         step = used_items // (batch_size * accumulation_steps)  
         batch_old_logps=[]
@@ -661,6 +822,7 @@ for epoch in range(num_epochs):
             cur_attention_mask=[]
             cur_loss_mask=[]
             cur_rewards=[]
+            micro_batch_index=0
             
             for j in range(len(batch_data['messages'])):
                 
@@ -701,7 +863,7 @@ for epoch in range(num_epochs):
                         ref_logits=ref_outputs.logits
                             
                     else:
-                        ref_logits=batch_ref_logps[j]
+                        ref_logits=batch_ref_logps[micro_batch_index]
                         
                     model.target_model.enable_adapter_layers()
                     outputs=model.target_model(cur_input_ids,cur_attention_mask)
@@ -709,7 +871,7 @@ for epoch in range(num_epochs):
                     if grpo_iteration==0:
                         old_logits=None
                     else:
-                        old_logits=batch_old_logps[j]
+                        old_logits=batch_old_logps[micro_batch_index]
                         
                     loss,abs_loss1,loss2,old_logits,ref_logits=compute_target_loss(
                         outputs.logits,ref_logits,old_logits,
@@ -722,6 +884,7 @@ for epoch in range(num_epochs):
                         
                     loss=loss/len(batch_data['messages'])
                     loss.backward()
+                    micro_batch_index += 1
                     
                     cur_input_ids=[input_ids[j]]
                     cur_attention_mask=[attention_mask[j]]
@@ -755,7 +918,7 @@ for epoch in range(num_epochs):
                 ref_logits=ref_outputs.logits
                     
             else:
-                ref_logits=batch_ref_logps[j]
+                ref_logits=batch_ref_logps[micro_batch_index]
                 
             model.target_model.enable_adapter_layers()
             outputs=model.target_model(cur_input_ids,cur_attention_mask)
@@ -763,7 +926,7 @@ for epoch in range(num_epochs):
             if grpo_iteration==0:
                 old_logits=None
             else:
-                old_logits=batch_old_logps[j]
+                old_logits=batch_old_logps[micro_batch_index]
                 
             loss,abs_loss1,loss2,old_logits,ref_logits=compute_target_loss(
                 outputs.logits,ref_logits,old_logits,
@@ -794,6 +957,7 @@ for epoch in range(num_epochs):
                 "epoch":epoch+1,
                 "step": step,
                 "used_items" : used_items ,
+                "generation_backend":generation_backend,
                 f"length_range" : round(mean(batch_data['length_range']),4),
                 f"length_cv" : round(mean(batch_data['length_cv']),4) ,
                 f"length_stdev" : round(mean(batch_data['length_stdev']),4) ,  
@@ -815,6 +979,7 @@ for epoch in range(num_epochs):
                 "train_time_cost":round(batch_data['train_time_cost']/60,3),
                 "check_time_cost":round(batch_data['check_time_cost']/60,3),
                 "mean_reward":round(batch_data['mean_rewards']/used_items,4),
+                "task_metrics":_summarize_task_stats(batch_data['task_stats']),
                 
                 "draft_train_time_cost":round(batch_data['draft_train_time_cost']/60,3) if is_train_draft else 0, 
                 f"last_{sample_num}_draft_loss1":round(sum(batch_data['last_draft_loss1'][-real_sample_num:])/len(batch_data['last_draft_loss1'][-real_sample_num:]),4) if is_train_draft and draft_step > 0 else 0,
@@ -829,15 +994,16 @@ for epoch in range(num_epochs):
         batch_data['messages'].clear()
         batch_data['rewards'].clear()
         batch_data['std_rewards'].clear()
+        batch_data['task_ids'].clear()
         batch_old_logps.clear()
         batch_ref_logps.clear()
 
         if step%500==0 and step!=0:
-            model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
+            if generation_backend == "speculative":
+                model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
             model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
             
 
-model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
+if generation_backend == "speculative":
+    model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
 model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')   
-
-

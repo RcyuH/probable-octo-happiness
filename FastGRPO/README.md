@@ -25,7 +25,7 @@ The key innovations of this project include:
 
 
 ## 🛠️ Prerequisites
-
+ 
 Before starting training, please complete the following setup steps:
 
 ### Step 1: Environment Setup
@@ -97,6 +97,72 @@ python grpo_speculative.py \
     --saved_draft_model_dir <dir_to_save_draft_model_checkpoints> \       
     --saved_statistics_dir <dir_to_save_generation_length_stats> \       
 ```
+
+### Multi-task RLVR Benchmarking
+
+The default training path is still the original math-only setup. To benchmark
+FastGRPO on a multi-task RLVR mixture, pass a task config with `--task_config`.
+The script then keeps the same GRPO/speculative decoding logic, but routes each
+sample through task-aware prompting, reward dispatch, and per-task logging.
+
+Example config: `configs/multitask_rlvr.example.json`
+
+Supported built-in reward types:
+- `math_latex`: math verifier reward plus optional format reward
+- `exact_match`: normalized exact string match
+- `contains`: normalized substring match
+- `regex`: regex match through `pattern`
+- `format_only`: checks the `<think>` closing tag format used by the original script
+- `zero`: always returns 0
+
+You can also set `custom_reward_func` to a Python callable path such as
+`my_rewards.code_reward`. The callable receives `completion=` and `example=`.
+For math datasets, `answer_extraction: "gsm8k_hash"` extracts the text after
+`####`, and `answer_template: "\\boxed{{{answer}}}"` wraps the verifier target.
+
+FastGRPO run:
+
+```bash
+python grpo_speculative.py \
+    --model_dir <path_to_target_model> \
+    --adapter_path <path_to_pretrained_draft_adapter> \
+    --task_config configs/multitask_rlvr.example.json \
+    --generation_backend speculative \
+    --model_type qwen2 \
+    --version_name multitask_fastgrpo \
+    --batch_size 4 \
+    --num_epochs 1 \
+    --repeated_generate_nums 8 \
+    --is_train_draft True \
+    --log_file <path_to_fastgrpo_log> \
+    --saved_model_dir <dir_to_save_target_checkpoints> \
+    --saved_draft_model_dir <dir_to_save_draft_checkpoints> \
+    --saved_statistics_dir <dir_to_save_generation_stats>
+```
+
+Target-only baseline with the same harness:
+
+```bash
+python grpo_speculative.py \
+    --model_dir <path_to_target_model> \
+    --adapter_path <path_to_pretrained_draft_adapter> \
+    --task_config configs/multitask_rlvr.example.json \
+    --generation_backend target \
+    --model_type qwen2 \
+    --version_name multitask_target_baseline \
+    --batch_size 4 \
+    --num_epochs 1 \
+    --repeated_generate_nums 8 \
+    --is_train_draft False \
+    --log_file <path_to_baseline_log> \
+    --saved_model_dir <dir_to_save_target_checkpoints> \
+    --saved_draft_model_dir <dir_to_save_draft_checkpoints> \
+    --saved_statistics_dir <dir_to_save_generation_stats>
+```
+
+The JSON logs include `generation_backend` and `task_metrics`, so compare
+`generate_time_cost`, `train_time_cost`, `mean_reward`, `average_acc_length`,
+and the per-task skip counts between these two runs.
 
 
 ### Speculative Generate Function Parameters
