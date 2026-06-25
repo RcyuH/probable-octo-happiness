@@ -93,9 +93,12 @@ python3 PROS/fastgpro_based_pros/train_pros.py \
 ```
 
 Supported reward types are inherited from FastGRPO: `math_latex`,
-`exact_match`, `contains`, `regex`, `format_only`, `zero`, and custom reward
-callables through `custom_reward_func`. Logs include `generation_backend` and
-`task_metrics`.
+`exact_match`, `contains`, `regex`, `format_only`, `code`, `zero`, and custom
+reward callables through `custom_reward_func`. The built-in `code` reward is a
+non-executing placeholder that checks extracted code, Python syntax,
+`entry_point`, and optional expected substrings; plug sandboxed unit-test
+execution in through `custom_reward_func` for real coding RLVR. Logs include
+`generation_backend` and `task_metrics`.
 
 Use these knobs for the closest original-PROS behavior:
 

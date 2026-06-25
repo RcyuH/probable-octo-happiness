@@ -8,8 +8,14 @@ import random
 from functools import lru_cache
 from pathlib import Path
 
-import datasets
-import pandas as pd
+try:
+    import datasets
+except ModuleNotFoundError:
+    datasets = None
+try:
+    import pandas as pd
+except ModuleNotFoundError:
+    pd = None
 
 from helper.rewards import compute_reward_from_example
 
@@ -20,6 +26,13 @@ MATH_USER_PROMPT = """Below is an instruction that describes a task, paired with
             Your response should include your thought process enclosed within <think></think> tags
             and the final answer enclosed within <answer></answer> tags (Just put a number between the tags).\n
             ### Instruction:\n{instruction}\nPlease reason step by step, and put your final answer within \\boxed{{}}"""
+CODE_SYSTEM_PROMPT = "You are a careful programming assistant."
+CODE_USER_PROMPT = """Solve the following coding problem in {language}.
+Return only the final solution code unless the problem explicitly asks for an explanation.
+
+Problem:
+{instruction}
+"""
 
 DEFAULT_PROMPTS = {
     "math": {
@@ -31,8 +44,8 @@ DEFAULT_PROMPTS = {
         "user_prompt_template": "{instruction}",
     },
     "code": {
-        "system_prompt": "You are a careful programming assistant.",
-        "user_prompt_template": "{instruction}",
+        "system_prompt": CODE_SYSTEM_PROMPT,
+        "user_prompt_template": CODE_USER_PROMPT,
     },
     "generic": {
         "system_prompt": "You are a helpful assistant.",
@@ -45,6 +58,8 @@ DEFAULT_PROMPT_FIELDS = (
     "prompt",
     "question",
     "problem",
+    "description",
+    "task",
     "instruction",
     "input",
 )
@@ -53,8 +68,31 @@ DEFAULT_ANSWER_FIELDS = (
     "ground_truth",
     "answer",
     "solution",
+    "canonical_solution",
+    "reference_solution",
     "label",
 )
+DEFAULT_LANGUAGE_FIELDS = ("language", "lang", "programming_language")
+DEFAULT_ENTRY_POINT_FIELDS = (
+    "entry_point",
+    "function_name",
+    "metadata.entry_point",
+    "metadata.function_name",
+)
+DEFAULT_TEST_FIELDS = (
+    "tests",
+    "test",
+    "unit_tests",
+    "test_cases",
+    "metadata.tests",
+    "metadata.test_cases",
+)
+DEFAULT_EXPECTED_SUBSTRING_FIELDS = (
+    "expected_substrings",
+    "required_substrings",
+    "metadata.expected_substrings",
+)
+DEFAULT_STARTER_CODE_FIELDS = ("starter_code", "boilerplate", "metadata.starter_code")
 
 
 def load_multitask_QAs(config_path, split="train", samples_per_epoch=None, seed=42):
@@ -110,10 +148,14 @@ def render_messages(example):
     system_prompt = example.get("system_prompt") or defaults["system_prompt"]
     user_prompt_template = example.get("user_prompt_template") or defaults["user_prompt_template"]
     instruction = example.get("question") or example.get("prompt") or example.get("instruction") or ""
+    format_values = _SafeFormatDict(example)
+    format_values["instruction"] = instruction
+    if not format_values.get("language"):
+        format_values["language"] = "python"
 
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt_template.format_map({"instruction": instruction})},
+        {"role": "user", "content": user_prompt_template.format_map(format_values)},
     ]
 
 
@@ -138,6 +180,7 @@ def _load_task_samples(task, split="train"):
 
     prompt_type = task.get("prompt_type", "generic")
     prompt_defaults = DEFAULT_PROMPTS.get(prompt_type, DEFAULT_PROMPTS["generic"])
+    default_reward_type = _default_reward_type(prompt_type)
     normalized = []
 
     for idx, record in enumerate(records):
@@ -145,12 +188,23 @@ def _load_task_samples(task, split="train"):
         answer = _pick_value(record, task.get("answer_field"), DEFAULT_ANSWER_FIELDS)
         answer = _transform_answer(_stringify_field(answer), task)
         metadata = _extract_metadata(record, task)
+        language = _pick_value(record, task.get("language_field"), DEFAULT_LANGUAGE_FIELDS)
+        language = task.get("language", language)
+        entry_point = _pick_value(record, task.get("entry_point_field"), DEFAULT_ENTRY_POINT_FIELDS)
+        entry_point = task.get("entry_point", entry_point)
+        tests = _pick_value(record, task.get("tests_field"), DEFAULT_TEST_FIELDS)
+        expected_substrings = _pick_value(
+            record,
+            task.get("expected_substrings_field"),
+            DEFAULT_EXPECTED_SUBSTRING_FIELDS,
+        )
+        starter_code = _pick_value(record, task.get("starter_code_field"), DEFAULT_STARTER_CODE_FIELDS)
 
         item = {
             "task_id": task_id,
             "question": _stringify_field(prompt),
             "answer": answer,
-            "reward_type": task.get("reward_type", "math_latex"),
+            "reward_type": task.get("reward_type", default_reward_type),
             "prompt_type": prompt_type,
             "system_prompt": task.get("system_prompt", prompt_defaults["system_prompt"]),
             "user_prompt_template": task.get("user_prompt_template", prompt_defaults["user_prompt_template"]),
@@ -158,6 +212,16 @@ def _load_task_samples(task, split="train"):
             "task_weight": float(task.get("weight", 1.0)),
             "metadata": metadata,
         }
+        if language is not None:
+            item["language"] = _stringify_field(language)
+        if entry_point is not None:
+            item["entry_point"] = _stringify_field(entry_point)
+        if tests is not None:
+            item["tests"] = tests
+        if expected_substrings is not None:
+            item["expected_substrings"] = _normalize_list_field(expected_substrings)
+        if starter_code is not None:
+            item["starter_code"] = _stringify_field(starter_code)
 
         if task.get("custom_reward_func"):
             item["custom_reward_func"] = task["custom_reward_func"]
@@ -174,6 +238,34 @@ def _load_task_samples(task, split="train"):
     return normalized
 
 
+class _SafeFormatDict(dict):
+    def __init__(self, example):
+        super().__init__(example)
+        metadata = example.get("metadata") or {}
+        if isinstance(metadata, dict):
+            for key, value in metadata.items():
+                self.setdefault(key, value)
+
+    def __missing__(self, key):
+        return ""
+
+
+def _default_reward_type(prompt_type):
+    if prompt_type == "code":
+        return "code"
+    return "math_latex"
+
+
+def _normalize_list_field(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [_stringify_field(item) for item in value if item is not None]
+    return [_stringify_field(value)]
+
+
 def _read_records(task, split="train"):
     if "records" in task:
         return list(task["records"])
@@ -187,6 +279,8 @@ def _read_records(task, split="train"):
 
     if path_obj.exists() and path_obj.is_file():
         if suffix == ".parquet":
+            if pd is None:
+                raise ModuleNotFoundError("Reading parquet task data requires pandas.")
             return pd.read_parquet(path_obj).to_dict(orient="records")
         if suffix in (".json", ".jsonl"):
             return _read_json_records(path_obj)
@@ -197,6 +291,8 @@ def _read_records(task, split="train"):
         raise ValueError(f"Unsupported dataset file type: {path}")
 
     dataset_split = task.get("split", split)
+    if datasets is None:
+        raise ModuleNotFoundError("Loading Hugging Face datasets requires the datasets package.")
     dataset = datasets.load_dataset(path, split=dataset_split)
     return list(dataset)
 

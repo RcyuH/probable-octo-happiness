@@ -1,17 +1,29 @@
 """Reward functions for GRPO training."""
 
 import asyncio
+import ast
 import json
 import math
 import re
 from typing import Dict
 
-from latex2sympy2_extended import NormalizationConfig
-from math_verify import LatexExtractionConfig, parse, verify
+try:
+    from latex2sympy2_extended import NormalizationConfig
+    from math_verify import LatexExtractionConfig, parse, verify
+except ModuleNotFoundError:
+    NormalizationConfig = None
+    LatexExtractionConfig = None
+    parse = None
+    verify = None
 
 
 def accuracy_reward_func(completions, solution, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
+    if parse is None or verify is None or LatexExtractionConfig is None or NormalizationConfig is None:
+        raise ModuleNotFoundError(
+            "math_latex rewards require latex2sympy2_extended and math_verify. "
+            "Install the FastGRPO requirements or use a non-math reward type."
+        )
     rewards = []
     for content, sol in zip(completions, solution):
         gold_parsed = parse(
@@ -102,6 +114,80 @@ def regex_reward_func(completions, pattern, **kwargs):
     return rewards
 
 
+def _extract_code_text(completion):
+    """Extract the first fenced code block when present; otherwise return text."""
+    if completion is None:
+        return ""
+    text = str(completion).strip()
+    fenced = re.search(r"```(?:[a-zA-Z0-9_+\-.#]*)\s*(.*?)```", text, flags=re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip()
+    return text
+
+
+def _get_code_language(example):
+    metadata = example.get("metadata") or {}
+    language = example.get("language") or metadata.get("language") or "python"
+    return str(language).lower()
+
+
+def _get_entry_point(example):
+    metadata = example.get("metadata") or {}
+    return example.get("entry_point") or metadata.get("entry_point") or metadata.get("function_name")
+
+
+def _get_expected_substrings(example):
+    metadata = example.get("metadata") or {}
+    expected = example.get("expected_substrings") or metadata.get("expected_substrings") or []
+    if isinstance(expected, str):
+        expected = [expected]
+    return [str(item) for item in expected if item is not None]
+
+
+def code_placeholder_reward_func(completion, example):
+    """Heuristic code reward used until sandboxed unit-test execution is plugged in.
+
+    This intentionally does not execute generated code. For production code-RLVR,
+    provide ``custom_reward_func`` in the task config and run tests in a sandbox.
+    The placeholder rewards non-empty extracted code, Python syntax validity when
+    applicable, an optional ``entry_point`` occurrence, and optional expected
+    substrings.
+    """
+    code = _extract_code_text(completion)
+    if not code:
+        return 0.0
+
+    language = _get_code_language(example)
+    entry_point = _get_entry_point(example)
+    expected_substrings = _get_expected_substrings(example)
+
+    score = float(example.get("non_empty_weight", 0.2))
+    remaining = max(1.0 - score, 0.0)
+
+    syntax_weight = float(example.get("syntax_weight", 0.4))
+    if language in ("py", "python", "python3"):
+        try:
+            ast.parse(code)
+            score += syntax_weight
+        except SyntaxError:
+            pass
+    else:
+        # Non-Python syntax checking is intentionally left to custom evaluators.
+        score += min(syntax_weight, remaining)
+
+    if entry_point:
+        entry_weight = float(example.get("entry_point_weight", 0.2))
+        if re.search(rf"\b{re.escape(str(entry_point))}\b", code):
+            score += entry_weight
+
+    if expected_substrings:
+        substring_weight = float(example.get("substring_weight", 0.2))
+        matched = sum(1 for expected in expected_substrings if expected in code)
+        score += substring_weight * matched / len(expected_substrings)
+
+    return float(max(0.0, min(score, 1.0)))
+
+
 def _get_solution(example):
     for key in ("answer", "solution", "ground_truth", "label"):
         if key in example and example[key] is not None:
@@ -144,12 +230,14 @@ def compute_reward_from_example(completion, example):
     if reward_type in ("format", "format_only"):
         return float(format_reward_func([completion])[0])
 
+    if reward_type in ("code", "coding", "code_placeholder", "code_syntax"):
+        return code_placeholder_reward_func(completion, example)
+
     if reward_type in ("none", "zero"):
         return 0.0
 
     raise ValueError(
         f"Unsupported reward_type={reward_type!r}. "
-        "Use math_latex, exact_match, contains, regex, format_only, zero, "
+        "Use math_latex, exact_match, contains, regex, format_only, code, zero, "
         "or provide a custom_reward_func through the multi-task config."
     )
-

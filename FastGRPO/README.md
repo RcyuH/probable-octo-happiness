@@ -113,12 +113,20 @@ Supported built-in reward types:
 - `contains`: normalized substring match
 - `regex`: regex match through `pattern`
 - `format_only`: checks the `<think>` closing tag format used by the original script
+- `code`: placeholder coding reward; extracts code, checks Python syntax when `language`
+  is Python, checks optional `entry_point`, and checks optional
+  `expected_substrings`
 - `zero`: always returns 0
 
 You can also set `custom_reward_func` to a Python callable path such as
 `my_rewards.code_reward`. The callable receives `completion=` and `example=`.
+Use this hook for real coding-task evaluation with sandboxed unit-test execution.
+The built-in `code` reward does not execute generated code.
 For math datasets, `answer_extraction: "gsm8k_hash"` extracts the text after
 `####`, and `answer_template: "\\boxed{{{answer}}}"` wraps the verifier target.
+For coding datasets, set `prompt_type: "code"` and optionally provide
+`language`, `entry_point_field`, `tests_field`, `starter_code_field`, and
+`expected_substrings_field`.
 
 FastGRPO run:
 
