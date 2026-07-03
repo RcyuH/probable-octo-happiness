@@ -92,6 +92,18 @@ parser.add_argument('--repeated_generate_nums',type=int,default=8)
 parser.add_argument('--beta',type=float,default=0.01)
 parser.add_argument('--epsilon',type=float,default=0.1)
 parser.add_argument('--max_length',type=int,default=2048)
+parser.add_argument('--verification_capacity', type=int, default=160,
+                    help='Total speculative verification token budget shared across active generations.')
+parser.add_argument('--max_draft_token_length', type=int, default=5,
+                    help='Maximum adaptive draft-tree depth.')
+parser.add_argument('--min_draft_token_length', type=int, default=3,
+                    help='Minimum adaptive draft-tree depth.')
+parser.add_argument('--max_draft_k', type=int, default=8,
+                    help='Maximum draft branching factor.')
+parser.add_argument('--max_verification_num', type=int, default=160,
+                    help='Maximum verification tokens per active sequence.')
+parser.add_argument('--draft_token_length_c', type=float, default=0.75,
+                    help='Adaptive draft length constant; smaller values make deeper drafts.')
 parser.add_argument('--max_training_padding_gap',type=int,default=256)
 parser.add_argument('--max_training_token',type=int,default=3072)
 parser.add_argument('--log_file', type=str, required=True,
@@ -114,6 +126,12 @@ repeated_generate_nums=args.repeated_generate_nums
 beta=args.beta
 epsilon=args.epsilon
 max_length=args.max_length
+verification_capacity = args.verification_capacity
+max_draft_token_length = args.max_draft_token_length
+min_draft_token_length = args.min_draft_token_length
+max_draft_k = args.max_draft_k
+max_verification_num = args.max_verification_num
+draft_token_length_c = args.draft_token_length_c
 max_training_padding_gap=args.max_training_padding_gap
 max_training_token=args.max_training_token
 batch_size = args.batch_size
@@ -139,12 +157,33 @@ seed = args.seed
 generation_backend = args.generation_backend
 use_tensorboard = args.use_tensorboard
 tensorboard_log_dir = args.tensorboard_log_dir
+speculative_config = {
+    "verification_capacity": verification_capacity,
+    "max_draft_token_length": max_draft_token_length,
+    "min_draft_token_length": min_draft_token_length,
+    "max_draft_k": max_draft_k,
+    "max_verification_num": max_verification_num,
+    "draft_token_length_c": draft_token_length_c,
+}
 
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
+
+if verification_capacity <= 0:
+    raise ValueError("--verification_capacity must be positive.")
+if max_verification_num <= 1:
+    raise ValueError("--max_verification_num must be greater than 1.")
+if max_draft_k <= 0:
+    raise ValueError("--max_draft_k must be positive.")
+if min_draft_token_length <= 0 or max_draft_token_length <= 0:
+    raise ValueError("--min_draft_token_length and --max_draft_token_length must be positive.")
+if min_draft_token_length > max_draft_token_length:
+    raise ValueError("--min_draft_token_length must be <= --max_draft_token_length.")
+if draft_token_length_c <= 0:
+    raise ValueError("--draft_token_length_c must be positive.")
 
 if not os.path.exists(saved_model_dir):
     os.makedirs(saved_model_dir)
@@ -167,6 +206,10 @@ print(f"LR: target={target_lr}, draft={draft_lr} | "
       f"Seq: max_len={max_length}, max_tokens={max_training_token}, pad_gap={max_training_padding_gap}")
 print(f"Gen: temp={temperature}, top_p={top_p}"
       f"beta={beta}, epsilon={epsilon}")
+print("Speculative: "
+      f"verification_capacity={verification_capacity}, max_verification_num={max_verification_num}, "
+      f"min_draft_len={min_draft_token_length}, max_draft_len={max_draft_token_length}, "
+      f"max_draft_k={max_draft_k}, draft_len_c={draft_token_length_c}")
 print(f"Generation backend: {generation_backend}")
 print(f"Task config: {task_config if task_config else args.train_option}")
 print(f"Draft: train={is_train_draft}")
@@ -893,6 +936,9 @@ for epoch in range(num_epochs):
             if generation_backend == "speculative":
                 outputs=speculative_generate(model=model,input_ids=input_ids,attention_mask=attention_mask,tokenizer=tokenizer,
                 do_sample=True,max_length=max_length,repeated_generate_nums=repeated_generate_nums,temperature=temperature,top_p=top_p,
+                verification_capacity=verification_capacity,max_draft_token_length=max_draft_token_length,
+                min_draft_token_length=min_draft_token_length,max_draft_k=max_draft_k,
+                max_verification_num=max_verification_num,draft_token_length_c=draft_token_length_c,
                 return_all_draft_input=True,statistical_time=True)
             else:
                 outputs=target_generate(model=model,input_ids=input_ids,attention_mask=attention_mask,tokenizer=tokenizer,
@@ -1052,6 +1098,7 @@ for epoch in range(num_epochs):
             "batch_length_range": length_range,
             "batch_length_cv": round(length_cv, 4),
             "batch_average_acc_length": round(outputs['total_acc_length'] / outputs['total_decoded_token_num'], 4) if outputs['total_decoded_token_num'] else 0,
+            "speculative_config": speculative_config,
             "generation_perf": generation_perf,
             "reward_debug_batch": _summarize_reward_debug(batch_reward_debug),
             "reward_debug": _summarize_reward_debug(batch_data['reward_debug']),
@@ -1277,6 +1324,7 @@ for epoch in range(num_epochs):
                 "train_time_cost":round(batch_data['train_time_cost']/60,3),
                 "check_time_cost":round(batch_data['check_time_cost']/60,3),
                 "mean_reward":round(batch_data['mean_rewards']/used_items,4) if used_items else 0,
+                "speculative_config": speculative_config,
                 "generation_perf": cumulative_generation_perf,
                 "reward_debug":_summarize_reward_debug(batch_data['reward_debug']),
                 "task_metrics":_summarize_task_stats(batch_data['task_stats']),

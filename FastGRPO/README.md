@@ -86,6 +86,12 @@ python grpo_speculative.py \
     --temperature 1.0 \
     --top_p 0.95 \
     --max_length 2048 \
+    --verification_capacity 160 \
+    --max_draft_token_length 5 \
+    --min_draft_token_length 3 \
+    --max_draft_k 8 \
+    --max_verification_num 160 \
+    --draft_token_length_c 0.75 \
     --max_training_padding_gap 256 \
     --max_training_token 3072 \
     --grpo_iteration_num 1 \
@@ -150,6 +156,12 @@ python grpo_speculative.py \
     --batch_size 4 \
     --num_epochs 1 \
     --repeated_generate_nums 8 \
+    --verification_capacity 160 \
+    --max_draft_token_length 5 \
+    --min_draft_token_length 3 \
+    --max_draft_k 8 \
+    --max_verification_num 160 \
+    --draft_token_length_c 0.75 \
     --is_train_draft True \
     --log_file <path_to_fastgrpo_log> \
     --use_tensorboard True \
@@ -248,6 +260,26 @@ The speculative_generate function is the core function of our project. The follo
 | `max_verification_num` | int | `160` | Maximum number of tokens to verify |
 | `min_draft_token_length` | int | `3` | Minimum length of draft tokens |
 | `draft_token_length_c` | float | 0.75 | A parameter that affects the tuning of the draft token length and should be set based on the capability of the draft model; the stronger the draft model, the smaller this value should be |
+
+In `grpo_speculative.py`, these adaptive speculative decoding parameters are
+also exposed as CLI flags:
+
+```bash
+--verification_capacity 160 \
+--max_draft_token_length 5 \
+--min_draft_token_length 3 \
+--max_draft_k 8 \
+--max_verification_num 160 \
+--draft_token_length_c 0.75
+```
+
+`verification_capacity` is a practical per-run budget, not a universal constant.
+It should be tuned for the target model size, GPU memory/latency profile, dtype,
+batch size, `repeated_generate_nums`, and max sequence length. Internally, the
+active batch shares this capacity, so each sequence receives roughly
+`floor(verification_capacity / active_batch_size)` verification tokens before
+`max_verification_num` is applied. Increase it only if the GPU has enough
+headroom and generation throughput improves.
 #### Output Control Parameters
 | Parameter | Type | Default | Description |
 |----------|------|---------|-------------|
