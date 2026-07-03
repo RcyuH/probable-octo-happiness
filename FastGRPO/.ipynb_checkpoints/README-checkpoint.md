@@ -1,0 +1,232 @@
+
+# FastGRPO
+
+[FastGRPO](https://arxiv.org/abs/2509.21792) is an **adaptive speculative decoding framework** for Group Relative Policy Optimization (GRPO) that dynamically adjusts drafting and verification strategies based on real-time concurrency levels. The framework addresses the prohibitively slow training process of GRPO by maximizing acceleration of the generation phase while maintaining reasoning capabilities.
+
+## 📋 Overview
+
+The key innovations of this project include:
+
+1. **Adaptive Speculative Decoding**: Dynamically adjusts drafting and verification strategy based on real-time concurrency levels, maximizing the acceleration of the generation process
+2. **Joint Draft Model Training**: Mitigates performance degradation caused by distributional drift between the evolving target model and draft model through continuous adaptation using feedback from the target model
+3. **Significant Speedup**: Achieves an end-to-end speedup of 2.35× to 2.72× compared to baseline approaches
+
+### Core Components
+
+1. **`train_draft.py`**: Pre-training script for the draft model
+   - Used for initial draft model training
+   - Can be used standalone for draft model preparation
+
+2. **`grpo_speculative.py`**: Main training script for the GRPO speculative decoding framework
+   - Jointly trains target and draft models
+   - Implements speculative decoding during training
+   - Accelerates GRPO training process without performance loss
+
+
+
+## 🛠️ Prerequisites
+ 
+Before starting training, please complete the following setup steps:
+
+### Step 1: Environment Setup
+Install the required dependencies via the provided `requirement.txt`:
+```bash
+pip install -r requirement.txt
+```
+
+### Step 2: Dataset Preparation
+Download and place the training dataset under the `data/` directory.  
+Ensure the data is properly formatted and accessible. Example:
+```
+data/
+├── simplelr_abel_level3to5
+├── gsm8k
+└── ...
+```
+
+
+## 🚀 Usage
+
+### GRPO Speculative Training (Joint Training)
+
+Launch the joint training process for both target and draft models:
+
+```bash
+python train_draft.py \
+    --model_dir <path_to_pretrained_model> \
+    --version_name <your_experiment_name> \
+    --model_type qwen2 \
+    --batch_size 1 \
+    --num_epochs 10 \
+    --lr 5e-5 \
+    --accumulation_steps 16 \
+    --warmup_ratio 0.05 \
+    --sample_num 100 \
+    --log_dir <path_to_training_log_dir> \
+    --saved_model_dir <dir_to_save_model_checkpoints> \
+    --dataset_dir <dir_to_dataset>
+```
+
+```bash
+python grpo_speculative.py \
+    --model_dir <path_to_target_model> \                                  
+    --adapter_path <path_to_pretrained_draft_adapter> \                  
+    --load_lora_path <path_to_resume_checkpoint_or_empty> \               
+    --model_type qwen2 \                                      
+    --train_option simplelr_abel_level3to5 \                          
+    --version_name debug \                            
+    --batch_size 4 \
+    --num_epochs 10 \
+    --sample_num 100 \
+    --accumulation_steps 4 \
+    --draft_accumulation_steps 1 \
+    --target_lr 1e-6 \
+    --draft_lr 1e-4 \
+    --is_train_draft True \
+    --temperature 1.0 \
+    --top_p 0.95 \
+    --max_length 2048 \
+    --max_training_padding_gap 256 \
+    --max_training_token 3072 \
+    --grpo_iteration_num 1 \
+    --repeated_generate_nums 8 \
+    --beta 0.04 \
+    --epsilon 0.1 \
+    --log_file <path_to_save_training_log> \                                           
+    --saved_model_dir <dir_to_save_target_model_checkpoints> \           
+    --saved_draft_model_dir <dir_to_save_draft_model_checkpoints> \       
+    --saved_statistics_dir <dir_to_save_generation_length_stats> \       
+```
+
+### Multi-task RLVR Benchmarking
+
+The default training path is still the original math-only setup. To benchmark
+FastGRPO on a multi-task RLVR mixture, pass a task config with `--task_config`.
+The script then keeps the same GRPO/speculative decoding logic, but routes each
+sample through task-aware prompting, reward dispatch, and per-task logging.
+
+Example config: `configs/multitask_rlvr.example.json`
+
+Supported built-in reward types:
+- `math_latex`: math verifier reward plus optional format reward
+- `exact_match`: normalized exact string match
+- `contains`: normalized substring match
+- `regex`: regex match through `pattern`
+- `format_only`: checks the `<think>` closing tag format used by the original script
+- `code`: placeholder coding reward; extracts code, checks Python syntax when `language`
+  is Python, checks optional `entry_point`, and checks optional
+  `expected_substrings`
+- `code_unit_test`: executes generated Python in a local subprocess against the
+  configured `tests`; supports assert-style tests, `unittest.TestCase` classes,
+  pytest-style `test_*` functions, and `test_type: "stdin_stdout"` cases with
+  `{"input": "...", "output": "..."}` records. Configure `timeout_seconds`
+  per task or record.
+- `zero`: always returns 0
+
+You can also set `custom_reward_func` to a Python callable path such as
+`my_rewards.code_reward`. The callable receives `completion=` and `example=`.
+Use `code_unit_test` for built-in coding-task evaluation, or use this hook when
+you need a hardened external sandbox. The built-in `code` reward does not
+execute generated code. `code_unit_test` runs generated code on the local
+training machine with a timeout; use it only in a trusted environment.
+For math datasets, `answer_extraction: "gsm8k_hash"` extracts the text after
+`####`, and `answer_template: "\\boxed{{{answer}}}"` wraps the verifier target.
+For coding datasets, set `prompt_type: "code"` and optionally provide
+`language`, `entry_point_field`, `tests_field`, `test_type`, `timeout_seconds`,
+`starter_code_field`, and `expected_substrings_field`.
+
+FastGRPO run:
+
+```bash
+python grpo_speculative.py \
+    --model_dir <path_to_target_model> \
+    --adapter_path <path_to_pretrained_draft_adapter> \
+    --task_config configs/multitask_rlvr.example.json \
+    --generation_backend speculative \
+    --model_type qwen2 \
+    --version_name multitask_fastgrpo \
+    --batch_size 4 \
+    --num_epochs 1 \
+    --repeated_generate_nums 8 \
+    --is_train_draft True \
+    --log_file <path_to_fastgrpo_log> \
+    --saved_model_dir <dir_to_save_target_checkpoints> \
+    --saved_draft_model_dir <dir_to_save_draft_checkpoints> \
+    --saved_statistics_dir <dir_to_save_generation_stats>
+```
+
+Target-only baseline with the same harness:
+
+```bash
+python grpo_speculative.py \
+    --model_dir <path_to_target_model> \
+    --adapter_path <path_to_pretrained_draft_adapter> \
+    --task_config configs/multitask_rlvr.example.json \
+    --generation_backend target \
+    --model_type qwen2 \
+    --version_name multitask_target_baseline \
+    --batch_size 4 \
+    --num_epochs 1 \
+    --repeated_generate_nums 8 \
+    --is_train_draft False \
+    --log_file <path_to_baseline_log> \
+    --saved_model_dir <dir_to_save_target_checkpoints> \
+    --saved_draft_model_dir <dir_to_save_draft_checkpoints> \
+    --saved_statistics_dir <dir_to_save_generation_stats>
+```
+
+The JSON logs include `generation_backend` and `task_metrics`, so compare
+`generate_time_cost`, `train_time_cost`, `mean_reward`, `average_acc_length`,
+and the per-task skip counts between these two runs.
+
+
+### Speculative Generate Function Parameters
+
+The speculative_generate function is the core function of our project. The following is an introduction to its parameters:
+
+#### Basic Parameters
+| Parameter | Type | Description |
+|----------|------|-------------|
+| `input_ids` | tensor | Input token IDs for the generation process (shape: [batch_size, seq_len]) |
+| `attention_mask` | tensor | Attention mask to indicate which tokens are valid (shape: [batch_size, seq_len]) |
+| `tokenizer` | tokenizer | The tokenizer associated with the model for encoding/decoding tokens |
+
+#### Sampling Parameters
+| Parameter | Type | Default | Description |
+|----------|------|---------|-------------|
+| `do_sample` | bool | `False` | Whether to use sampling (`True`) or greedy decoding (`False`) |
+| `temperature` | float | `0.8` | Sampling temperature for controlling randomness |
+| `top_p` | float | `0.9` | Top-p (nucleus) sampling threshold |
+| `top_k` | int | `None` | Top-k sampling parameter |
+
+#### Adaptive Control Parameters
+| Parameter | Type | Default | Description |
+|----------|------|---------|-------------|
+| `verification_capacity` | int | `160` | Maximum capacity for verification tokens |
+| `max_draft_token_length` | int | `5` | Maximum length of draft tokens to generate |
+| `max_draft_k` | int | `8` | Maximum branching factor for draft tree |
+| `max_verification_num` | int | `160` | Maximum number of tokens to verify |
+| `min_draft_token_length` | int | `3` | Minimum length of draft tokens |
+| `draft_token_length_c` | float | 0.75 | A parameter that affects the tuning of the draft token length and should be set based on the capability of the draft model; the stronger the draft model, the smaller this value should be |
+#### Output Control Parameters
+| Parameter | Type | Default | Description |
+|----------|------|---------|-------------|
+| `repeated_generate_nums` | int | `None` | Number of repeated generations for each input |
+| `statistical_time` | bool | `True` | Whether to collect timing statistics |
+| `return_all_draft_input` | bool | `False` | Whether to return all draft inputs |
+| `max_length` | int | `2048` | Maximum length of generated sequences |
+
+
+## Reference
+
+```
+@misc{zhang2025fastgrpoacceleratingpolicyoptimization,
+      title={FastGRPO: Accelerating Policy Optimization via Concurrency-aware Speculative Decoding and Online Draft Learning}, 
+      author={Yizhou Zhang and Ning Lv and Teng Wang and Jisheng Dang},
+      year={2025},
+      eprint={2509.21792},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2509.21792}, 
+}
+```

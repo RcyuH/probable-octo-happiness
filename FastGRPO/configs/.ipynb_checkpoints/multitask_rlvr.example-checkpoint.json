@@ -1,0 +1,54 @@
+{
+  "samples_per_epoch": 1000,
+  "tasks": [
+    {
+      "id": "gsm8k_local",
+      "path": "data/train-00000-of-00001.parquet",
+      "weight": 0.4,
+      "prompt_type": "math",
+      "reward_type": "math_latex",
+      "prompt_field": "question",
+      "answer_field": "answer",
+      "answer_extraction": "gsm8k_hash",
+      "answer_template": "\\boxed{{{answer}}}",
+      "format_weight": 0.2,
+      "max_samples": 1000
+    },
+    {
+      "id": "math500_local",
+      "path": "data/math-500/train.parquet",
+      "weight": 0.2,
+      "prompt_type": "math",
+      "reward_type": "math_latex",
+      "prompt_field": "problem",
+      "answer_field": "answer",
+      "answer_template": "\\boxed{{{answer}}}"
+    },
+    {
+      "id": "qa_exact_local",
+      "path": "data/qa/train.jsonl",
+      "weight": 0.2,
+      "prompt_type": "qa",
+      "reward_type": "exact_match",
+      "prompt_field": "question",
+      "answer_field": "answer"
+    },
+    {
+      "id": "python_code_local",
+      "path": "data/code/train.jsonl",
+      "weight": 0.2,
+      "prompt_type": "code",
+      "reward_type": "code_unit_test",
+      "prompt_field": ["prompt", "question", "problem", "description"],
+      "answer_field": ["canonical_solution", "reference_solution", "solution", "answer"],
+      "language": "python",
+      "entry_point_field": "entry_point",
+      "tests_field": ["tests", "test", "unit_tests", "test_cases"],
+      "test_type": "unit",
+      "timeout_seconds": 5.0,
+      "expected_substrings_field": "expected_substrings",
+      "starter_code_field": "starter_code",
+      "max_samples": 1000
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "samples_per_epoch": 1000,
+  "tasks": [
+    {
+      "id": "gsm8k_local",
+      "path": "/workspace/storage-shared/nlp/huypq51/projects/AAAI27_no_name/probable-octo-happiness-main/FastGRPO/data/gsm8k_train_grpo/train.jsonl",
+      "weight": 0.5,
+      "prompt_type": "math",
+      "reward_type": "math_latex",
+      "prompt_field": "question",
+      "answer_field": "answer",
+      "answer_extraction": "gsm8k_hash",
+      "answer_template": "\\boxed{{{answer}}}",
+      "format_weight": 0.2,
+      "max_samples": 1000
+    },
+    {
+      "id": "taco_local",
+      "path": "/workspace/storage-shared/nlp/huypq51/projects/AAAI27_no_name/probable-octo-happiness-main/FastGRPO/data/taco_train/train.jsonl",
+      "weight": 0.5,
+      "prompt_type": "code",
+      "reward_type": "code_unit_test",
+      "messages_field": ["prompt", "messages"],
+      "language": "python",
+      "entry_point_field": "entry_point",
+      "tests_field": ["tests", "test", "unit_tests", "test_cases"],
+      "timeout_seconds": 5.0,
+      "max_samples": 1000
+    }
+  ]
+}
