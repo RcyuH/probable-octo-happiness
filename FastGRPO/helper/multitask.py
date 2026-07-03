@@ -17,7 +17,7 @@ try:
 except ModuleNotFoundError:
     pd = None
 
-from helper.rewards import compute_reward_from_example
+from helper.rewards import compute_reward_debug_from_example, compute_reward_from_example
 
 
 MATH_SYSTEM_PROMPT = "You are a math problem assistant."
@@ -174,6 +174,22 @@ def compute_multitask_reward(completion, example):
         reward_func = _load_callable(custom_reward_func)
         return float(reward_func(completion=completion, example=example))
     return compute_reward_from_example(completion, example)
+
+
+def compute_multitask_reward_debug(completion, example):
+    """Compute reward and return a diagnostics dict for logging/debugging."""
+    custom_reward_func = example.get("custom_reward_func")
+    if custom_reward_func:
+        reward_func = _load_callable(custom_reward_func)
+        reward = float(reward_func(completion=completion, example=example))
+        return {
+            "reward": reward,
+            "reward_type": str(example.get("reward_type", "custom")),
+            "custom_reward": True,
+            "passed": reward > 0,
+            "error_type": "custom_reward_failed" if reward <= 0 else "none",
+        }
+    return compute_reward_debug_from_example(completion, example)
 
 
 def _load_task_samples(task, split="train"):

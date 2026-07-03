@@ -416,6 +416,11 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     start_time=time.time()
     target_past_key_values=DynamicCache()
     avg_acc_length=[0,0]
+    speculative_emitted_token_num=0
+    speculative_accepted_draft_token_num=0
+    speculative_verified_draft_token_num=0
+    speculative_path_budget_token_num=0
+    speculative_verification_round_num=0
     eos_token_id = tokenizer.eos_token_id
     bsz=input_ids.shape[0]
     end_sig=[0]*bsz
@@ -736,6 +741,11 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 
                 avg_acc_length[0]=avg_acc_length[0]+acc_length[idx_tree]
                 avg_acc_length[1]+=1
+                speculative_emitted_token_num += acc_length[idx_tree]
+                speculative_accepted_draft_token_num += max(acc_length[idx_tree] - 1, 0)
+                speculative_verified_draft_token_num += draft_total_token
+                speculative_path_budget_token_num += draft_token_length
+                speculative_verification_round_num += 1
                         
             else:
                 acc_length[idx_tree]=0
@@ -1086,6 +1096,11 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'total_acc_length':avg_acc_length[0],
         'total_acc':max_sequence_length/token_num,
         'total_decoded_token_num':avg_acc_length[1],
+        'speculative_emitted_tokens':speculative_emitted_token_num,
+        'speculative_accepted_draft_tokens':speculative_accepted_draft_token_num,
+        'speculative_verified_draft_tokens':speculative_verified_draft_token_num,
+        'speculative_path_budget_tokens':speculative_path_budget_token_num,
+        'speculative_verification_rounds':speculative_verification_round_num,
         'total_time_cost':time.time()-start_time,
         'target_time_cost':total_target_time,
         'draft_time_cost':total_draft_time,

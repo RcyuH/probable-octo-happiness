@@ -92,7 +92,9 @@ python grpo_speculative.py \
     --repeated_generate_nums 8 \
     --beta 0.04 \
     --epsilon 0.1 \
-    --log_file <path_to_save_training_log> \                                           
+    --log_file <path_to_save_training_log> \
+    --use_tensorboard True \
+    --tensorboard_log_dir <path_to_tensorboard_dir> \
     --saved_model_dir <dir_to_save_target_model_checkpoints> \           
     --saved_draft_model_dir <dir_to_save_draft_model_checkpoints> \       
     --saved_statistics_dir <dir_to_save_generation_length_stats> \       
@@ -150,6 +152,8 @@ python grpo_speculative.py \
     --repeated_generate_nums 8 \
     --is_train_draft True \
     --log_file <path_to_fastgrpo_log> \
+    --use_tensorboard True \
+    --tensorboard_log_dir <path_to_tensorboard_dir> \
     --saved_model_dir <dir_to_save_target_checkpoints> \
     --saved_draft_model_dir <dir_to_save_draft_checkpoints> \
     --saved_statistics_dir <dir_to_save_generation_stats>
@@ -178,6 +182,42 @@ python grpo_speculative.py \
 The JSON logs include `generation_backend` and `task_metrics`, so compare
 `generate_time_cost`, `train_time_cost`, `mean_reward`, `average_acc_length`,
 and the per-task skip counts between these two runs.
+
+TensorBoard scalar logs are enabled by default when the `tensorboard` package is
+installed. If `--tensorboard_log_dir` is omitted, event files are written to a
+`tensorboard/` directory beside `--log_file`.
+
+```bash
+tensorboard --logdir <path_to_tensorboard_dir>
+```
+
+The log stream now emits both `generation` events and `train` events.
+Generation events are written even when every group is skipped and `used_items`
+does not increase. Reward diagnostics are available under `reward_debug`,
+`reward_debug_batch`, and each `task_metrics.<task_id>.reward_debug`, including:
+- `error_type_counts`: verifier/reward outcomes such as `none`, `empty_tests`,
+  `empty_completion`, `syntax`, `runtime`, `assertion`, `wrong_answer`,
+  `timeout`, `import`, and `unsupported_language`
+- `ignored_incorrect_error_type_counts`: error types among completions in groups
+  skipped as `ignore_due_incorrect`
+- `ignored_correct_error_type_counts`: outcomes among groups skipped as
+  `ignore_due_correct`
+- `missing_tests_count`, `missing_entry_point_count`, `pass_rate`,
+  `mean_extracted_code_chars`, and `test_type_counts`
+
+Speculative decoding metrics are logged under `generation_perf`:
+- `speculative_avg_emitted_tokens_per_round`: average number of output tokens
+  emitted per target verification round; this is the explicit version of the
+  older `average_acc_length` metric
+- `speculative_avg_accepted_draft_tokens_per_round`: average accepted draft
+  tokens per verification round, excluding the guaranteed target token
+- `speculative_path_acceptance_rate`: accepted draft tokens divided by the
+  draft-path token budget; this is usually the most intuitive acceptance-rate
+  metric
+- `speculative_tree_acceptance_rate`: accepted draft tokens divided by all draft
+  tokens verified in the draft tree
+- `speculative_verified_draft_tokens_per_round`, `speculative_verification_rounds`,
+  `speculative_accepted_draft_tokens`, and `generated_tokens_per_second`
 
 
 ### Speculative Generate Function Parameters

@@ -7,7 +7,7 @@ import math
 import re
 from typing import Dict
 
-from helper.code_verifier import verify_code_completion
+from helper.code_verifier import extract_python_code, verify_code_completion
 
 try:
     from latex2sympy2_extended import NormalizationConfig
@@ -222,21 +222,63 @@ def _get_timeout_seconds(example):
     )
 
 
+def _has_tests(tests):
+    if tests is None:
+        return False
+    if isinstance(tests, str):
+        return bool(tests.strip())
+    try:
+        return len(tests) > 0
+    except TypeError:
+        return True
+
+
 def code_unit_test_reward_func(completion, example):
     """Reward 1.0 only when generated Python passes configured tests."""
+    return code_unit_test_reward_details(completion, example)["reward"]
+
+
+def code_unit_test_reward_details(completion, example):
+    """Return unit-test reward and verifier diagnostics for one completion."""
     language = _get_code_language(example)
+    tests = _get_tests(example)
+    entry_point = _get_entry_point(example)
+    test_type = _get_test_type(example)
+    extracted_code = extract_python_code(completion, entry_point=entry_point)
+    detail = {
+        "reward": 0.0,
+        "reward_type": "code_unit_test",
+        "language": language,
+        "test_type": str(test_type),
+        "has_tests": _has_tests(tests),
+        "has_entry_point": bool(entry_point),
+        "completion_chars": len(str(completion or "")),
+        "extracted_code_chars": len(extracted_code),
+        "passed": False,
+        "timed_out": False,
+        "error_type": "none",
+    }
     if language not in ("py", "python", "python3"):
-        return 0.0
+        detail["error_type"] = "unsupported_language"
+        return detail
 
     result = verify_code_completion(
         completion,
-        _get_tests(example),
-        entry_point=_get_entry_point(example),
-        test_type=_get_test_type(example),
+        tests,
+        entry_point=entry_point,
+        test_type=test_type,
         timeout_seconds=_get_timeout_seconds(example),
         starter_code=example.get("starter_code") or (example.get("metadata") or {}).get("starter_code"),
     )
-    return 1.0 if result.passed else 0.0
+    detail.update({
+        "reward": 1.0 if result.passed else 0.0,
+        "passed": bool(result.passed),
+        "timed_out": bool(result.timed_out),
+        "error_type": result.error_type,
+        "stdout_chars": len(result.stdout or ""),
+        "stderr_chars": len(result.stderr or ""),
+    })
+    return detail
 
 
 def _get_solution(example):
@@ -296,3 +338,137 @@ def compute_reward_from_example(completion, example):
         "code_unit_test, zero, "
         "or provide a custom_reward_func through the multi-task config."
     )
+
+
+def compute_reward_debug_from_example(completion, example):
+    """Compute reward and return lightweight diagnostics for logging/debugging."""
+    reward_type = example.get("reward_type", "math_latex")
+    solution = _get_solution(example)
+
+    if reward_type in ("math", "math_latex", "latex_accuracy", "accuracy"):
+        return _math_latex_reward_details(completion, solution, example)
+
+    if reward_type in ("exact", "exact_match"):
+        reward = 0.0 if solution is None else float(exact_match_reward_func([completion], [solution])[0])
+        return _basic_reward_detail(reward, reward_type, "missing_solution" if solution is None else "none")
+
+    if reward_type in ("contains", "substring"):
+        reward = 0.0 if solution is None else float(contains_reward_func([completion], [solution])[0])
+        return _basic_reward_detail(reward, reward_type, "missing_solution" if solution is None else "none")
+
+    if reward_type == "regex":
+        pattern = example.get("pattern")
+        if pattern is None:
+            pattern = (example.get("metadata") or {}).get("pattern")
+        reward = float(regex_reward_func([completion], [pattern])[0])
+        return _basic_reward_detail(reward, reward_type, "missing_pattern" if pattern is None else "none")
+
+    if reward_type in ("format", "format_only"):
+        reward = float(format_reward_func([completion])[0])
+        return _basic_reward_detail(reward, reward_type, "format_failed" if reward == 0 else "none")
+
+    if reward_type in ("code", "coding", "code_placeholder", "code_syntax"):
+        reward = float(code_placeholder_reward_func(completion, example))
+        error_type = "none" if reward >= 1.0 else "partial_or_failed_static_checks"
+        return _basic_reward_detail(reward, reward_type, error_type)
+
+    if reward_type in ("code_unit_test", "code_tests", "unit_test", "python_unit_test"):
+        return code_unit_test_reward_details(completion, example)
+
+    if reward_type in ("none", "zero"):
+        return _basic_reward_detail(0.0, reward_type, "zero_reward")
+
+    raise ValueError(
+        f"Unsupported reward_type={reward_type!r}. "
+        "Use math_latex, exact_match, contains, regex, format_only, code, "
+        "code_unit_test, zero, "
+        "or provide a custom_reward_func through the multi-task config."
+    )
+
+
+def _basic_reward_detail(reward, reward_type, error_type):
+    reward = float(reward)
+    if error_type == "none" and reward <= 0:
+        error_type = "incorrect"
+    return {
+        "reward": reward,
+        "reward_type": str(reward_type),
+        "passed": reward > 0,
+        "error_type": error_type,
+    }
+
+
+def _math_latex_reward_details(completion, solution, example):
+    reward_type = example.get("reward_type", "math_latex")
+    if solution is None:
+        return _basic_reward_detail(0.0, reward_type, "missing_solution")
+    if parse is None or verify is None or LatexExtractionConfig is None or NormalizationConfig is None:
+        raise ModuleNotFoundError(
+            "math_latex rewards require latex2sympy2_extended and math_verify. "
+            "Install the FastGRPO requirements or use a non-math reward type."
+        )
+
+    format_weight = float(example.get("format_weight", 0.2))
+    gold_parsed = parse(
+        solution,
+        extraction_mode="first_match",
+        extraction_config=[LatexExtractionConfig()],
+    )
+    if len(gold_parsed) == 0:
+        reward = 1.0
+        return {
+            "reward": reward,
+            "reward_type": str(reward_type),
+            "passed": True,
+            "error_type": "gold_parse_failed",
+            "gold_parse_failed": True,
+            "answer_parse_failed": False,
+            "format_reward": float(format_reward_func([completion])[0]) if format_weight else 0.0,
+        }
+
+    answer_parsed = parse(
+        completion,
+        extraction_config=[
+            LatexExtractionConfig(
+                normalization_config=NormalizationConfig(
+                    nits=False,
+                    malformed_operators=False,
+                    basic_latex=True,
+                    equations=True,
+                    boxed="all",
+                    units=True,
+                ),
+                boxed_match_priority=0,
+                try_extract_without_anchor=False,
+            )
+        ],
+        extraction_mode="first_match",
+    )
+    try:
+        answer_reward = float(verify(answer_parsed, gold_parsed))
+        verify_error = None
+    except Exception as exc:
+        answer_reward = 0.0
+        verify_error = str(type(exc).__name__)
+
+    format_reward = float(format_reward_func([completion])[0]) if format_weight else 0.0
+    reward = answer_reward if format_weight == 0 else format_weight * format_reward + answer_reward
+    if verify_error:
+        error_type = "verify_exception"
+    elif len(answer_parsed) == 0:
+        error_type = "answer_parse_failed"
+    elif answer_reward <= 0:
+        error_type = "wrong_answer"
+    else:
+        error_type = "none"
+    return {
+        "reward": float(reward),
+        "reward_type": str(reward_type),
+        "passed": answer_reward > 0,
+        "error_type": error_type,
+        "gold_parse_failed": False,
+        "answer_parse_failed": len(answer_parsed) == 0,
+        "answer_reward": answer_reward,
+        "format_reward": format_reward,
+        "verify_error": verify_error or "",
+    }

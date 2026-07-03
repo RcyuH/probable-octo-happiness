@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from helper.multitask import load_multitask_QAs, render_messages
+from helper.multitask import compute_multitask_reward_debug, load_multitask_QAs, render_messages
 from helper.rewards import compute_reward_from_example
 
 
@@ -51,6 +51,39 @@ def solve():
             "timeout_seconds": 1.0,
         }
         self.assertEqual(compute_reward_from_example(completion, example), 0.0)
+
+    def test_code_unit_test_debug_reports_assertion_failures(self):
+        completion = """```python
+def solve():
+    return 2
+```"""
+        example = {
+            "reward_type": "code_unit_test",
+            "language": "python",
+            "entry_point": "solve",
+            "tests": "assert solve() == 1",
+            "timeout_seconds": 1.0,
+        }
+        detail = compute_multitask_reward_debug(completion, example)
+        self.assertEqual(detail["reward"], 0.0)
+        self.assertEqual(detail["error_type"], "assertion")
+        self.assertFalse(detail["passed"])
+
+    def test_code_unit_test_debug_reports_empty_tests(self):
+        completion = """```python
+def solve():
+    return 1
+```"""
+        example = {
+            "reward_type": "code_unit_test",
+            "language": "python",
+            "entry_point": "solve",
+            "tests": "",
+            "timeout_seconds": 1.0,
+        }
+        detail = compute_multitask_reward_debug(completion, example)
+        self.assertEqual(detail["reward"], 0.0)
+        self.assertEqual(detail["error_type"], "empty_tests")
 
     def test_code_unit_test_reward_executes_stdin_stdout_tests(self):
         completion = """```python

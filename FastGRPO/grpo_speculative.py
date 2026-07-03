@@ -17,6 +17,8 @@ import signal
 import sys
 import torch
 import random
+import math
+import re
 from copy import deepcopy
 from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftType
 from datetime import datetime
@@ -24,11 +26,16 @@ import argparse
 from statistics import mean , stdev
 import pickle
 from helper.multitask import (
-    compute_multitask_reward,
+    compute_multitask_reward_debug,
     load_multitask_QAs,
     normalize_single_task_QAs,
     render_messages,
 )
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
 def handle_signal(signum, frame):
     print("Received signal, cleaning up...")
@@ -39,6 +46,17 @@ def handle_signal(signum, frame):
 
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
+
+
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).lower()
+    if value in ("true", "1", "yes", "y", "on"):
+        return True
+    if value in ("false", "0", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
 
 
 parser = argparse.ArgumentParser(description="Training configuration")
@@ -84,6 +102,10 @@ parser.add_argument('--saved_draft_model_dir', type=str, required=True,
                     help="Directory to save trained draft model checkpoints")
 parser.add_argument('--saved_statistics_dir', type=str, required=True,
                     help="Directory to save statistics of generated sequence lengths.")
+parser.add_argument('--use_tensorboard', type=str_to_bool, nargs="?", const=True, default=True,
+                    help="Whether to write TensorBoard scalar logs.")
+parser.add_argument('--tensorboard_log_dir', type=str, default="",
+                    help="TensorBoard log directory. Defaults to a tensorboard/ folder beside --log_file.")
 args = parser.parse_args()
 num_epochs=args.num_epochs
 sample_num=args.sample_num
@@ -115,6 +137,8 @@ task_split = args.task_split
 task_samples_per_epoch = args.task_samples_per_epoch
 seed = args.seed
 generation_backend = args.generation_backend
+use_tensorboard = args.use_tensorboard
+tensorboard_log_dir = args.tensorboard_log_dir
 
 random.seed(seed)
 np.random.seed(seed)
@@ -527,6 +551,11 @@ def target_generate(model, input_ids, attention_mask, tokenizer,
         "total_acc_length": total_decoded_token_num,
         "total_acc": 1.0,
         "total_decoded_token_num": max(total_decoded_token_num, 1),
+        "speculative_emitted_tokens": total_decoded_token_num,
+        "speculative_accepted_draft_tokens": 0,
+        "speculative_verified_draft_tokens": 0,
+        "speculative_path_budget_tokens": 0,
+        "speculative_verification_rounds": 0,
         "total_time_cost": total_time_cost,
         "target_time_cost": target_time_cost,
         "draft_time_cost": 0,
@@ -538,16 +567,194 @@ def target_generate(model, input_ids, attention_mask, tokenizer,
     }
 
 
+def _safe_div(numerator, denominator):
+    return float(numerator) / float(denominator) if denominator else 0.0
+
+
+def _generation_perf_metrics(outputs, token_ids_length):
+    generated_completion_tokens = int(sum(token_ids_length))
+    total_time = float(outputs.get("total_time_cost", 0.0) or 0.0)
+    emitted_tokens = int(outputs.get("speculative_emitted_tokens", outputs.get("total_acc_length", 0)) or 0)
+    accepted_draft_tokens = int(outputs.get("speculative_accepted_draft_tokens", 0) or 0)
+    verified_draft_tokens = int(outputs.get("speculative_verified_draft_tokens", 0) or 0)
+    path_budget_tokens = int(outputs.get("speculative_path_budget_tokens", 0) or 0)
+    verification_rounds = int(outputs.get("speculative_verification_rounds", outputs.get("total_decoded_token_num", 0)) or 0)
+
+    return {
+        "generated_completion_tokens": generated_completion_tokens,
+        "generated_tokens_per_second": round(_safe_div(generated_completion_tokens, total_time), 4),
+        "speculative_verification_rounds": verification_rounds,
+        "speculative_emitted_tokens": emitted_tokens,
+        "speculative_accepted_draft_tokens": accepted_draft_tokens,
+        "speculative_verified_draft_tokens": verified_draft_tokens,
+        "speculative_path_budget_tokens": path_budget_tokens,
+        "speculative_avg_emitted_tokens_per_round": round(_safe_div(emitted_tokens, verification_rounds), 4),
+        "speculative_avg_accepted_draft_tokens_per_round": round(_safe_div(accepted_draft_tokens, verification_rounds), 4),
+        "speculative_path_acceptance_rate": round(_safe_div(accepted_draft_tokens, path_budget_tokens), 6),
+        "speculative_tree_acceptance_rate": round(_safe_div(accepted_draft_tokens, verified_draft_tokens), 6),
+        "speculative_verified_draft_tokens_per_round": round(_safe_div(verified_draft_tokens, verification_rounds), 4),
+        "target_time_ratio": round(_safe_div(outputs.get("target_time_cost", 0.0), total_time), 6),
+        "draft_time_ratio": round(_safe_div(outputs.get("draft_time_cost", 0.0), total_time), 6),
+        "check_time_ratio": round(_safe_div(outputs.get("check_time_cost", 0.0), total_time), 6),
+    }
+
+
+def _new_reward_debug_stats():
+    return {
+        "completion_count": 0,
+        "reward_sum": 0.0,
+        "reward_sq_sum": 0.0,
+        "pass_count": 0,
+        "fail_count": 0,
+        "timeout_count": 0,
+        "missing_tests_count": 0,
+        "missing_entry_point_count": 0,
+        "completion_chars_sum": 0.0,
+        "extracted_code_chars_sum": 0.0,
+        "stdout_chars_sum": 0.0,
+        "stderr_chars_sum": 0.0,
+        "used_group_count": 0,
+        "skip_group_count": 0,
+        "skip_due_correct_group_count": 0,
+        "skip_due_incorrect_group_count": 0,
+        "reward_type_counts": {},
+        "error_type_counts": {},
+        "test_type_counts": {},
+        "ignored_correct_error_type_counts": {},
+        "ignored_incorrect_error_type_counts": {},
+    }
+
+
+def _increment_counter(counter, key, amount=1):
+    key = str(key if key not in (None, "") else "unknown")
+    counter[key] = counter.get(key, 0) + amount
+
+
+def _record_reward_detail(stats, detail):
+    reward = float(detail.get("reward", 0.0))
+    stats["completion_count"] += 1
+    stats["reward_sum"] += reward
+    stats["reward_sq_sum"] += reward * reward
+    if detail.get("passed") or reward >= 1.0:
+        stats["pass_count"] += 1
+    else:
+        stats["fail_count"] += 1
+    if detail.get("timed_out"):
+        stats["timeout_count"] += 1
+    if detail.get("has_tests") is False:
+        stats["missing_tests_count"] += 1
+    test_type = str(detail.get("test_type") or "")
+    if (detail.get("has_entry_point") is False and
+            detail.get("reward_type") == "code_unit_test" and
+            test_type not in ("stdin_stdout", "stdio", "io", "input_output")):
+        stats["missing_entry_point_count"] += 1
+
+    for field in ("completion_chars", "extracted_code_chars", "stdout_chars", "stderr_chars"):
+        if field in detail:
+            stats[f"{field}_sum"] += float(detail.get(field) or 0.0)
+
+    _increment_counter(stats["reward_type_counts"], detail.get("reward_type"))
+    _increment_counter(stats["error_type_counts"], detail.get("error_type"))
+    if detail.get("test_type") is not None:
+        _increment_counter(stats["test_type_counts"], detail.get("test_type"))
+
+
+def _record_group_decision(stats, reward_details, decision):
+    if decision == "used":
+        stats["used_group_count"] += 1
+        return
+
+    stats["skip_group_count"] += 1
+    if decision == "ignore_due_correct":
+        stats["skip_due_correct_group_count"] += 1
+        target_counter = stats["ignored_correct_error_type_counts"]
+    else:
+        stats["skip_due_incorrect_group_count"] += 1
+        target_counter = stats["ignored_incorrect_error_type_counts"]
+    for detail in reward_details:
+        _increment_counter(target_counter, detail.get("error_type"))
+
+
+def _summarize_reward_debug(stats):
+    completion_count = stats["completion_count"]
+    reward_mean = stats["reward_sum"] / completion_count if completion_count else 0.0
+    reward_var = stats["reward_sq_sum"] / completion_count - reward_mean * reward_mean if completion_count else 0.0
+    reward_var = max(reward_var, 0.0)
+    return {
+        "completion_count": completion_count,
+        "mean_reward_all_completions": round(reward_mean, 4),
+        "reward_std_all_completions": round(math.sqrt(reward_var), 4),
+        "pass_rate": round(stats["pass_count"] / completion_count, 4) if completion_count else 0,
+        "fail_rate": round(stats["fail_count"] / completion_count, 4) if completion_count else 0,
+        "timeout_count": stats["timeout_count"],
+        "missing_tests_count": stats["missing_tests_count"],
+        "missing_entry_point_count": stats["missing_entry_point_count"],
+        "mean_completion_chars": round(stats["completion_chars_sum"] / completion_count, 2) if completion_count else 0,
+        "mean_extracted_code_chars": round(stats["extracted_code_chars_sum"] / completion_count, 2) if completion_count else 0,
+        "used_group_count": stats["used_group_count"],
+        "skip_group_count": stats["skip_group_count"],
+        "skip_due_correct_group_count": stats["skip_due_correct_group_count"],
+        "skip_due_incorrect_group_count": stats["skip_due_incorrect_group_count"],
+        "reward_type_counts": dict(stats["reward_type_counts"]),
+        "error_type_counts": dict(stats["error_type_counts"]),
+        "test_type_counts": dict(stats["test_type_counts"]),
+        "ignored_correct_error_type_counts": dict(stats["ignored_correct_error_type_counts"]),
+        "ignored_incorrect_error_type_counts": dict(stats["ignored_incorrect_error_type_counts"]),
+    }
+
+
+def _sanitize_tb_tag(value):
+    return re.sub(r"[^A-Za-z0-9_./-]", "_", str(value)).strip("/") or "unknown"
+
+
+def _write_tensorboard_scalars(writer, payload, step, prefix):
+    if writer is None:
+        return
+    for key, value in payload.items():
+        tag = f"{prefix}/{_sanitize_tb_tag(key)}"
+        if isinstance(value, dict):
+            _write_tensorboard_scalars(writer, value, step, tag)
+        elif isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+            value = float(value)
+            if math.isfinite(value):
+                writer.add_scalar(tag, value, step)
+    writer.flush()
+
+
+def _write_log_event(log_file, writer, payload, tb_step, tb_prefix):
+    payload["tb_step"] = tb_step
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(payload) + '\n')
+    _write_tensorboard_scalars(writer, payload, tb_step, tb_prefix)
+
+
+def _build_tensorboard_writer(use_tensorboard, tensorboard_log_dir, log_file):
+    if not use_tensorboard:
+        return None
+    if SummaryWriter is None:
+        print("TensorBoard logging requested, but tensorboard is not installed. Continuing with JSONL logs only.")
+        return None
+    if not tensorboard_log_dir:
+        base_log_dir = os.path.dirname(log_file) or "."
+        tensorboard_log_dir = os.path.join(base_log_dir, "tensorboard")
+    os.makedirs(tensorboard_log_dir, exist_ok=True)
+    print(f"TensorBoard log dir: {tensorboard_log_dir}")
+    return SummaryWriter(log_dir=tensorboard_log_dir)
+
+
 def _get_task_stat(task_stats, task_id):
     if task_id not in task_stats:
         task_stats[task_id] = {
             "used_items": 0,
             "reward_sum": 0.0,
             "reward_count": 0,
+            "all_reward_sum": 0.0,
+            "all_reward_count": 0,
             "generated_length_sum": 0.0,
             "generated_completion_count": 0,
             "ignore_due_correct": 0,
             "ignore_due_incorrect": 0,
+            "reward_debug": _new_reward_debug_stats(),
         }
     return task_stats[task_id]
 
@@ -560,10 +767,12 @@ def _summarize_task_stats(task_stats):
         summary[task_id] = {
             "used_items": stats["used_items"],
             "mean_reward": round(stats["reward_sum"] / reward_count, 4) if reward_count else 0,
+            "mean_reward_all_completions": round(stats["all_reward_sum"] / stats["all_reward_count"], 4) if stats["all_reward_count"] else 0,
             "mean_length": round(stats["generated_length_sum"] / completion_count, 3) if completion_count else 0,
             "generated_completions": completion_count,
             "ignore_due_correct": stats["ignore_due_correct"],
             "ignore_due_incorrect": stats["ignore_due_incorrect"],
+            "reward_debug": _summarize_reward_debug(stats["reward_debug"]),
         }
     return summary
 
@@ -572,12 +781,16 @@ optimizer_target = torch.optim.AdamW(model.target_model.parameters(), lr=target_
 optimizer_draft = torch.optim.AdamW(model.draft_model.parameters(), lr=draft_lr)
 
 log_dir = os.path.dirname(log_file)
-os.makedirs(log_dir, exist_ok=True)
+if log_dir:
+    os.makedirs(log_dir, exist_ok=True)
 with open(log_file,'w',encoding='utf-8') as f:
     pass
+tb_writer = _build_tensorboard_writer(use_tensorboard, tensorboard_log_dir, log_file)
+tb_log_step = 0
 
 step=0
 used_items=0
+generated_group_count=0
 draft_step=0
 draft_accumulated_step=0 
 batch_logs=[]
@@ -596,6 +809,12 @@ batch_data={
     'last_acc_length':[],
     'total_decoded_token_num':0,
     'last_decoded_token_num':[],
+    'generated_completion_tokens':0,
+    'speculative_emitted_tokens':0,
+    'speculative_accepted_draft_tokens':0,
+    'speculative_verified_draft_tokens':0,
+    'speculative_path_budget_tokens':0,
+    'speculative_verification_rounds':0,
     'prefill_time_cost':0,
     'target_time_cost':0,
     'draft_time_cost':0,
@@ -609,6 +828,7 @@ batch_data={
     'last_draft_loss2':[] ,
     'generate_length_list':[],
     'task_stats':{},
+    'reward_debug':_new_reward_debug_stats(),
 }
 
 optimizer_target.zero_grad(set_to_none=True)
@@ -684,6 +904,7 @@ for epoch in range(num_epochs):
         
         outputs['decoded_sequences']=[tokenizer.decode(x,skip_special_tokens=True) for x in outputs['generated_token_ids']]
         token_ids_length = [len(item) for item in outputs['generated_token_ids'] ]
+        generation_perf = _generation_perf_metrics(outputs, token_ids_length)
         length_stdev = stdev(token_ids_length) if len(token_ids_length) > 1 else 0.0
         length_range = max(token_ids_length) - min(token_ids_length)
         length_ave = mean(token_ids_length) if len(token_ids_length) > 0 else 0
@@ -710,9 +931,14 @@ for epoch in range(num_epochs):
         
         generate_length=0
         repeat_count = repeated_generate_nums or 1
+        batch_reward_debug = _new_reward_debug_stats()
+        batch_used_groups = 0
+        batch_skip_due_correct = 0
+        batch_skip_due_incorrect = 0
         for idx_batch in range(len(answers)):
             generate_length += outputs['max_sequence_length']
             rewards=[]
+            reward_details=[]
             new_messages=[]
             task_id = task_ids[idx_batch]
             reward_example = reward_examples[idx_batch]
@@ -730,13 +956,21 @@ for epoch in range(num_epochs):
                     "content":decoded_sequence
                 })
                 
-                reward=compute_multitask_reward(decoded_sequence, reward_example)
+                reward_detail=compute_multitask_reward_debug(decoded_sequence, reward_example)
+                reward=float(reward_detail["reward"])
                 
                 rewards.append(reward)
+                reward_details.append(reward_detail)
                 new_messages.append(new_message)
+                _record_reward_detail(batch_reward_debug, reward_detail)
+                _record_reward_detail(batch_data['reward_debug'], reward_detail)
+                _record_reward_detail(task_stat['reward_debug'], reward_detail)
 
             task_stat['generated_length_sum'] += sum(cur_lengths)
             task_stat['generated_completion_count'] += len(cur_lengths)
+            task_stat['all_reward_sum'] += float(sum(rewards))
+            task_stat['all_reward_count'] += len(rewards)
+            generated_group_count += 1
             
             
             rewards=np.array(rewards) 
@@ -745,9 +979,17 @@ for epoch in range(num_epochs):
                 if rewards[0]>=1.0:
                     batch_data['ignore_due_correct']+=1
                     task_stat['ignore_due_correct']+=1
+                    batch_skip_due_correct += 1
+                    _record_group_decision(batch_reward_debug, reward_details, "ignore_due_correct")
+                    _record_group_decision(batch_data['reward_debug'], reward_details, "ignore_due_correct")
+                    _record_group_decision(task_stat['reward_debug'], reward_details, "ignore_due_correct")
                 else:
                     batch_data['ignore_due_incorrect']+=1
                     task_stat['ignore_due_incorrect']+=1
+                    batch_skip_due_incorrect += 1
+                    _record_group_decision(batch_reward_debug, reward_details, "ignore_due_incorrect")
+                    _record_group_decision(batch_data['reward_debug'], reward_details, "ignore_due_incorrect")
+                    _record_group_decision(task_stat['reward_debug'], reward_details, "ignore_due_incorrect")
                     
                 continue
             
@@ -759,6 +1001,10 @@ for epoch in range(num_epochs):
             task_stat['used_items'] += 1
             task_stat['reward_sum'] += float(rewards.sum())
             task_stat['reward_count'] += len(rewards)
+            batch_used_groups += 1
+            _record_group_decision(batch_reward_debug, reward_details, "used")
+            _record_group_decision(batch_data['reward_debug'], reward_details, "used")
+            _record_group_decision(task_stat['reward_debug'], reward_details, "used")
             used_items+=1
             
         generate_length /= len(answers)
@@ -778,7 +1024,41 @@ for epoch in range(num_epochs):
         batch_data['generate_time_cost']+=outputs['total_time_cost']
         batch_data['total_acc_length']+=outputs['total_acc_length']
         batch_data['total_decoded_token_num']+=outputs['total_decoded_token_num']
+        batch_data['generated_completion_tokens']+=generation_perf['generated_completion_tokens']
+        batch_data['speculative_emitted_tokens']+=generation_perf['speculative_emitted_tokens']
+        batch_data['speculative_accepted_draft_tokens']+=generation_perf['speculative_accepted_draft_tokens']
+        batch_data['speculative_verified_draft_tokens']+=generation_perf['speculative_verified_draft_tokens']
+        batch_data['speculative_path_budget_tokens']+=generation_perf['speculative_path_budget_tokens']
+        batch_data['speculative_verification_rounds']+=generation_perf['speculative_verification_rounds']
         batch_data['generate_length']+=generate_length
+        generation_logs = {
+            "event": "generation",
+            "epoch": epoch+1,
+            "batch_index": i,
+            "step": step,
+            "used_items": used_items,
+            "generated_group_count": generated_group_count,
+            "generation_backend": generation_backend,
+            "batch_prompt_count": len(answers),
+            "batch_completion_count": len(outputs['generated_token_ids']),
+            "batch_used_group_count": batch_used_groups,
+            "batch_ignore_due_correct": batch_skip_due_correct,
+            "batch_ignore_due_incorrect": batch_skip_due_incorrect,
+            "ignore_due_correct_cur_epoch": batch_data['ignore_due_correct'],
+            "ignore_due_incorrect_cur_epoch": batch_data['ignore_due_incorrect'],
+            "batch_generate_time_cost": round(outputs['total_time_cost'], 4),
+            "batch_mean_length": round(generate_length, 3),
+            "batch_length_stdev": round(length_stdev, 4),
+            "batch_length_range": length_range,
+            "batch_length_cv": round(length_cv, 4),
+            "batch_average_acc_length": round(outputs['total_acc_length'] / outputs['total_decoded_token_num'], 4) if outputs['total_decoded_token_num'] else 0,
+            "generation_perf": generation_perf,
+            "reward_debug_batch": _summarize_reward_debug(batch_reward_debug),
+            "reward_debug": _summarize_reward_debug(batch_data['reward_debug']),
+            "task_metrics": _summarize_task_stats(batch_data['task_stats']),
+        }
+        _write_log_event(log_file, tb_writer, generation_logs, tb_log_step, "generation")
+        tb_log_step += 1
         batch=[]
 
         if len(batch_data['messages']) == 0:
@@ -954,11 +1234,27 @@ for epoch in range(num_epochs):
             batch_data['mean_rewards']+=sum(batch_data['rewards'])/len(batch_data['rewards'])
             
             real_sample_num=sample_num*accumulation_steps
+            cumulative_generation_perf = {
+                "generated_completion_tokens": batch_data['generated_completion_tokens'],
+                "generated_tokens_per_second": round(_safe_div(batch_data['generated_completion_tokens'], batch_data['generate_time_cost']), 4),
+                "speculative_verification_rounds": batch_data['speculative_verification_rounds'],
+                "speculative_emitted_tokens": batch_data['speculative_emitted_tokens'],
+                "speculative_accepted_draft_tokens": batch_data['speculative_accepted_draft_tokens'],
+                "speculative_verified_draft_tokens": batch_data['speculative_verified_draft_tokens'],
+                "speculative_path_budget_tokens": batch_data['speculative_path_budget_tokens'],
+                "speculative_avg_emitted_tokens_per_round": round(_safe_div(batch_data['speculative_emitted_tokens'], batch_data['speculative_verification_rounds']), 4),
+                "speculative_avg_accepted_draft_tokens_per_round": round(_safe_div(batch_data['speculative_accepted_draft_tokens'], batch_data['speculative_verification_rounds']), 4),
+                "speculative_path_acceptance_rate": round(_safe_div(batch_data['speculative_accepted_draft_tokens'], batch_data['speculative_path_budget_tokens']), 6),
+                "speculative_tree_acceptance_rate": round(_safe_div(batch_data['speculative_accepted_draft_tokens'], batch_data['speculative_verified_draft_tokens']), 6),
+                "speculative_verified_draft_tokens_per_round": round(_safe_div(batch_data['speculative_verified_draft_tokens'], batch_data['speculative_verification_rounds']), 4),
+            }
             
             avg_logs = {
+                "event":"train",
                 "epoch":epoch+1,
                 "step": step,
                 "used_items" : used_items ,
+                "generated_group_count": generated_group_count,
                 "generation_backend":generation_backend,
                 f"length_range" : round(mean(batch_data['length_range']),4),
                 f"length_cv" : round(mean(batch_data['length_cv']),4) ,
@@ -980,7 +1276,9 @@ for epoch in range(num_epochs):
                 "draft_time_cost":round(batch_data['draft_time_cost']/60,3),
                 "train_time_cost":round(batch_data['train_time_cost']/60,3),
                 "check_time_cost":round(batch_data['check_time_cost']/60,3),
-                "mean_reward":round(batch_data['mean_rewards']/used_items,4),
+                "mean_reward":round(batch_data['mean_rewards']/used_items,4) if used_items else 0,
+                "generation_perf": cumulative_generation_perf,
+                "reward_debug":_summarize_reward_debug(batch_data['reward_debug']),
                 "task_metrics":_summarize_task_stats(batch_data['task_stats']),
                 
                 "draft_train_time_cost":round(batch_data['draft_train_time_cost']/60,3) if is_train_draft else 0, 
@@ -988,8 +1286,8 @@ for epoch in range(num_epochs):
                 f"last_{sample_num}_draft_loss2":round(sum(batch_data['last_draft_loss2'][-real_sample_num:])/len(batch_data['last_draft_loss2'][-real_sample_num:]),4) if is_train_draft and draft_step > 0 else 0 
             }
 
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(avg_logs) + '\n')
+            _write_log_event(log_file, tb_writer, avg_logs, tb_log_step, "train")
+            tb_log_step += 1
                 
             torch.cuda.empty_cache()
             
@@ -1009,3 +1307,5 @@ for epoch in range(num_epochs):
 if generation_backend == "speculative":
     model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
 model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')   
+if tb_writer is not None:
+    tb_writer.close()
