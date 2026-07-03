@@ -304,6 +304,26 @@ active batch shares this capacity, so each sequence receives roughly
 `floor(verification_capacity / active_batch_size)` verification tokens before
 `max_verification_num` is applied. Increase it only if the GPU has enough
 headroom and generation throughput improves.
+
+You can sweep candidate values with the benchmark helper:
+
+```bash
+python3 FastGRPO/benchmark_verification_capacity.py \
+  --model_dir /path/to/base_model \
+  --adapter_path /path/to/draft_model.pt \
+  --capacities 64,96,128:320:32 \
+  --batch_size 4 \
+  --repeated_generate_nums 8 \
+  --num_batches 3 \
+  --warmup_batches 1 \
+  --max_length 2048 \
+  --output_dir FastGRPO/benchmark_results
+```
+
+The benchmark writes per-batch JSONL plus summary CSV/JSON files and recommends
+the fastest successful capacity by generated tokens per second. Use
+`--task_config`, `--train_option`, `--prompt_file`, or repeated `--prompt` flags
+to benchmark prompts that match your real workload.
 #### Output Control Parameters
 | Parameter | Type | Default | Description |
 |----------|------|---------|-------------|
