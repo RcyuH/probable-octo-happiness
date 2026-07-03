@@ -25,6 +25,7 @@ from datetime import datetime
 import argparse 
 from statistics import mean , stdev
 import pickle
+from tqdm.auto import tqdm
 from helper.multitask import (
     compute_multitask_reward_debug,
     load_multitask_QAs,
@@ -180,22 +181,6 @@ seed = args.seed
 generation_backend = args.generation_backend
 use_tensorboard = args.use_tensorboard
 tensorboard_log_dir = args.tensorboard_log_dir
-speculative_config = {
-    "verification_capacity": verification_capacity,
-    "max_draft_token_length": max_draft_token_length,
-    "min_draft_token_length": min_draft_token_length,
-    "max_draft_k": max_draft_k,
-    "max_verification_num": max_verification_num,
-    "draft_token_length_c": draft_token_length_c,
-}
-lora_config_dict = {
-    "r": lora_r,
-    "lora_alpha": lora_alpha,
-    "lora_dropout": lora_dropout,
-    "target_modules": lora_target_modules,
-    "bias": lora_bias,
-}
-
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
@@ -807,17 +792,143 @@ def _sanitize_tb_tag(value):
     return re.sub(r"[^A-Za-z0-9_./-]", "_", str(value)).strip("/") or "unknown"
 
 
+_TB_TOP_LEVEL_KEYS = {
+    "generation": (
+        "used_items",
+        "generated_group_count",
+        "batch_prompt_count",
+        "batch_completion_count",
+        "batch_used_group_count",
+        "batch_ignore_due_correct",
+        "batch_ignore_due_incorrect",
+        "batch_generate_time_cost",
+        "batch_mean_length",
+        "batch_length_stdev",
+        "batch_length_range",
+        "batch_length_cv",
+        "batch_average_acc_length",
+    ),
+    "train": (
+        "used_items",
+        "generated_group_count",
+        "used_time",
+        "length_range",
+        "length_cv",
+        "length_stdev",
+        "ignore_due_correct_cur_epoch",
+        "ignore_due_incorrect_cur_epoch",
+        "generate_time_cost",
+        "train_time_cost",
+        "average_acc_length",
+        "mean_reward",
+        "draft_train_time_cost",
+    ),
+}
+_TB_LAST_KEY_MARKERS = (
+    "generate_time_cost",
+    "train_time_cost",
+    "acc_length",
+    "mean_rewards",
+    "mean_length",
+    "draft_loss1",
+    "draft_loss2",
+)
+_TB_GENERATION_PERF_KEYS = (
+    "generated_tokens_per_second",
+    "speculative_verification_rounds",
+    "speculative_avg_emitted_tokens_per_round",
+    "speculative_avg_accepted_draft_tokens_per_round",
+    "speculative_path_acceptance_rate",
+    "speculative_tree_acceptance_rate",
+    "speculative_verified_draft_tokens_per_round",
+)
+_TB_REWARD_DEBUG_KEYS = (
+    "completion_count",
+    "mean_reward_all_completions",
+    "reward_std_all_completions",
+    "pass_rate",
+    "fail_rate",
+    "timeout_count",
+    "missing_tests_count",
+    "missing_entry_point_count",
+    "used_group_count",
+    "skip_group_count",
+    "skip_due_correct_group_count",
+    "skip_due_incorrect_group_count",
+)
+_TB_TASK_KEYS = (
+    "used_items",
+    "mean_reward",
+    "mean_reward_all_completions",
+    "mean_length",
+    "generated_completions",
+    "ignore_due_correct",
+    "ignore_due_incorrect",
+)
+
+
+def _add_tb_scalar(writer, tag, value, step):
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        value = float(value)
+        if math.isfinite(value):
+            writer.add_scalar(tag, value, step)
+
+
+def _write_named_scalars(writer, values, keys, step, prefix):
+    for key in keys:
+        if key in values:
+            _add_tb_scalar(writer, f"{prefix}/{_sanitize_tb_tag(key)}", values[key], step)
+
+
 def _write_tensorboard_scalars(writer, payload, step, prefix):
     if writer is None:
         return
-    for key, value in payload.items():
-        tag = f"{prefix}/{_sanitize_tb_tag(key)}"
-        if isinstance(value, dict):
-            _write_tensorboard_scalars(writer, value, step, tag)
-        elif isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
-            value = float(value)
-            if math.isfinite(value):
-                writer.add_scalar(tag, value, step)
+    event = payload.get("event", prefix)
+    base_tag = _sanitize_tb_tag(prefix)
+    _write_named_scalars(writer, payload, _TB_TOP_LEVEL_KEYS.get(event, ()), step, base_tag)
+
+    if event == "train":
+        for key, value in payload.items():
+            if key.startswith("last_") and any(marker in key for marker in _TB_LAST_KEY_MARKERS):
+                _add_tb_scalar(writer, f"{base_tag}/{_sanitize_tb_tag(key)}", value, step)
+
+    generation_perf = payload.get("generation_perf")
+    if isinstance(generation_perf, dict):
+        _write_named_scalars(
+            writer,
+            generation_perf,
+            _TB_GENERATION_PERF_KEYS,
+            step,
+            f"{base_tag}/generation_perf",
+        )
+
+    for reward_key in ("reward_debug_batch", "reward_debug"):
+        reward_debug = payload.get(reward_key)
+        if isinstance(reward_debug, dict):
+            _write_named_scalars(
+                writer,
+                reward_debug,
+                _TB_REWARD_DEBUG_KEYS,
+                step,
+                f"{base_tag}/{_sanitize_tb_tag(reward_key)}",
+            )
+
+    task_metrics = payload.get("task_metrics")
+    if isinstance(task_metrics, dict):
+        for task_id, metrics in task_metrics.items():
+            if not isinstance(metrics, dict):
+                continue
+            task_tag = f"{base_tag}/task/{_sanitize_tb_tag(task_id)}"
+            _write_named_scalars(writer, metrics, _TB_TASK_KEYS, step, task_tag)
+            reward_debug = metrics.get("reward_debug")
+            if isinstance(reward_debug, dict):
+                _write_named_scalars(
+                    writer,
+                    reward_debug,
+                    _TB_REWARD_DEBUG_KEYS,
+                    step,
+                    f"{task_tag}/reward_debug",
+                )
     writer.flush()
 
 
@@ -968,6 +1079,13 @@ class TrainDataCollator:
 dataloader=DataLoader(QAs,collate_fn=TrainDataCollator(tokenizer=tokenizer),num_workers=4,
                     persistent_workers=True,batch_size=batch_size,shuffle=True,drop_last=False)
 
+train_progress = tqdm(
+    total=num_epochs * len(dataloader),
+    desc="Training",
+    dynamic_ncols=True,
+    unit="batch",
+)
+
 for epoch in range(num_epochs):
     
     batch_data['ignore_due_correct']=0
@@ -977,9 +1095,15 @@ for epoch in range(num_epochs):
     batch_data['length_cv'] = []
     
     for i,batch in enumerate(dataloader):
+        train_progress.set_description(f"Epoch {epoch+1}/{num_epochs}")
         
         if batch['input_ids'].shape[-1]>=max_length:
             batch=[]
+            train_progress.set_postfix({
+                "used": used_items,
+                "skip": "prompt>=max_length",
+            })
+            train_progress.update(1)
             continue
         
         input_ids=batch['input_ids'].to('cuda')
@@ -1155,8 +1279,6 @@ for epoch in range(num_epochs):
             "batch_length_range": length_range,
             "batch_length_cv": round(length_cv, 4),
             "batch_average_acc_length": round(outputs['total_acc_length'] / outputs['total_decoded_token_num'], 4) if outputs['total_decoded_token_num'] else 0,
-            "lora_config": lora_config_dict,
-            "speculative_config": speculative_config,
             "generation_perf": generation_perf,
             "reward_debug_batch": _summarize_reward_debug(batch_reward_debug),
             "reward_debug": _summarize_reward_debug(batch_data['reward_debug']),
@@ -1164,9 +1286,17 @@ for epoch in range(num_epochs):
         }
         _write_log_event(log_file, tb_writer, generation_logs, tb_log_step, "generation")
         tb_log_step += 1
+        progress_postfix = {
+            "used": used_items,
+            "reward": generation_logs["reward_debug_batch"]["mean_reward_all_completions"],
+            "tok/s": generation_perf["generated_tokens_per_second"],
+            "skip": batch_skip_due_correct + batch_skip_due_incorrect,
+        }
         batch=[]
 
         if len(batch_data['messages']) == 0:
+            train_progress.set_postfix(progress_postfix)
+            train_progress.update(1)
             continue 
         
         text=tokenizer.apply_chat_template(batch_data['messages'],tokenize=False,add_generation_prompt=False)
@@ -1382,8 +1512,6 @@ for epoch in range(num_epochs):
                 "train_time_cost":round(batch_data['train_time_cost']/60,3),
                 "check_time_cost":round(batch_data['check_time_cost']/60,3),
                 "mean_reward":round(batch_data['mean_rewards']/used_items,4) if used_items else 0,
-                "lora_config": lora_config_dict,
-                "speculative_config": speculative_config,
                 "generation_perf": cumulative_generation_perf,
                 "reward_debug":_summarize_reward_debug(batch_data['reward_debug']),
                 "task_metrics":_summarize_task_stats(batch_data['task_stats']),
@@ -1395,6 +1523,10 @@ for epoch in range(num_epochs):
 
             _write_log_event(log_file, tb_writer, avg_logs, tb_log_step, "train")
             tb_log_step += 1
+            progress_postfix.update({
+                "reward": avg_logs["mean_reward"],
+                "train_min": avg_logs["train_time_cost"],
+            })
                 
             torch.cuda.empty_cache()
             
@@ -1410,6 +1542,11 @@ for epoch in range(num_epochs):
                 model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
             model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
             
+        train_progress.set_postfix(progress_postfix)
+        train_progress.update(1)
+
+
+train_progress.close()
 
 if generation_backend == "speculative":
     model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
