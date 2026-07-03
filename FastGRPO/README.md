@@ -116,17 +116,24 @@ Supported built-in reward types:
 - `code`: placeholder coding reward; extracts code, checks Python syntax when `language`
   is Python, checks optional `entry_point`, and checks optional
   `expected_substrings`
+- `code_unit_test`: executes generated Python in a local subprocess against the
+  configured `tests`; supports assert-style tests, `unittest.TestCase` classes,
+  pytest-style `test_*` functions, and `test_type: "stdin_stdout"` cases with
+  `{"input": "...", "output": "..."}` records. Configure `timeout_seconds`
+  per task or record.
 - `zero`: always returns 0
 
 You can also set `custom_reward_func` to a Python callable path such as
 `my_rewards.code_reward`. The callable receives `completion=` and `example=`.
-Use this hook for real coding-task evaluation with sandboxed unit-test execution.
-The built-in `code` reward does not execute generated code.
+Use `code_unit_test` for built-in coding-task evaluation, or use this hook when
+you need a hardened external sandbox. The built-in `code` reward does not
+execute generated code. `code_unit_test` runs generated code on the local
+training machine with a timeout; use it only in a trusted environment.
 For math datasets, `answer_extraction: "gsm8k_hash"` extracts the text after
 `####`, and `answer_template: "\\boxed{{{answer}}}"` wraps the verifier target.
 For coding datasets, set `prompt_type: "code"` and optionally provide
-`language`, `entry_point_field`, `tests_field`, `starter_code_field`, and
-`expected_substrings_field`.
+`language`, `entry_point_field`, `tests_field`, `test_type`, `timeout_seconds`,
+`starter_code_field`, and `expected_substrings_field`.
 
 FastGRPO run:
 

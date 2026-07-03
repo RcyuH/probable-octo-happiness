@@ -7,6 +7,8 @@ import math
 import re
 from typing import Dict
 
+from helper.code_verifier import verify_code_completion
+
 try:
     from latex2sympy2_extended import NormalizationConfig
     from math_verify import LatexExtractionConfig, parse, verify
@@ -188,6 +190,55 @@ def code_placeholder_reward_func(completion, example):
     return float(max(0.0, min(score, 1.0)))
 
 
+def _get_tests(example):
+    metadata = example.get("metadata") or {}
+    for key in ("tests", "test", "unit_tests", "test_cases"):
+        if key in example and example[key] is not None:
+            return example[key]
+        if key in metadata and metadata[key] is not None:
+            return metadata[key]
+    return None
+
+
+def _get_test_type(example):
+    metadata = example.get("metadata") or {}
+    return (
+        example.get("test_type")
+        or example.get("code_test_type")
+        or metadata.get("test_type")
+        or metadata.get("code_test_type")
+        or "unit"
+    )
+
+
+def _get_timeout_seconds(example):
+    metadata = example.get("metadata") or {}
+    return (
+        example.get("timeout_seconds")
+        or example.get("code_timeout_seconds")
+        or metadata.get("timeout_seconds")
+        or metadata.get("code_timeout_seconds")
+        or 5.0
+    )
+
+
+def code_unit_test_reward_func(completion, example):
+    """Reward 1.0 only when generated Python passes configured tests."""
+    language = _get_code_language(example)
+    if language not in ("py", "python", "python3"):
+        return 0.0
+
+    result = verify_code_completion(
+        completion,
+        _get_tests(example),
+        entry_point=_get_entry_point(example),
+        test_type=_get_test_type(example),
+        timeout_seconds=_get_timeout_seconds(example),
+        starter_code=example.get("starter_code") or (example.get("metadata") or {}).get("starter_code"),
+    )
+    return 1.0 if result.passed else 0.0
+
+
 def _get_solution(example):
     for key in ("answer", "solution", "ground_truth", "label"):
         if key in example and example[key] is not None:
@@ -233,11 +284,15 @@ def compute_reward_from_example(completion, example):
     if reward_type in ("code", "coding", "code_placeholder", "code_syntax"):
         return code_placeholder_reward_func(completion, example)
 
+    if reward_type in ("code_unit_test", "code_tests", "unit_test", "python_unit_test"):
+        return code_unit_test_reward_func(completion, example)
+
     if reward_type in ("none", "zero"):
         return 0.0
 
     raise ValueError(
         f"Unsupported reward_type={reward_type!r}. "
-        "Use math_latex, exact_match, contains, regex, format_only, code, zero, "
+        "Use math_latex, exact_match, contains, regex, format_only, code, "
+        "code_unit_test, zero, "
         "or provide a custom_reward_func through the multi-task config."
     )

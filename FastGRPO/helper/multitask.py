@@ -87,6 +87,14 @@ DEFAULT_TEST_FIELDS = (
     "metadata.tests",
     "metadata.test_cases",
 )
+DEFAULT_TEST_TYPE_FIELDS = ("test_type", "code_test_type", "metadata.test_type")
+DEFAULT_TIMEOUT_FIELDS = (
+    "timeout_seconds",
+    "code_timeout_seconds",
+    "timeout",
+    "metadata.timeout_seconds",
+    "metadata.code_timeout_seconds",
+)
 DEFAULT_EXPECTED_SUBSTRING_FIELDS = (
     "expected_substrings",
     "required_substrings",
@@ -193,6 +201,10 @@ def _load_task_samples(task, split="train"):
         entry_point = _pick_value(record, task.get("entry_point_field"), DEFAULT_ENTRY_POINT_FIELDS)
         entry_point = task.get("entry_point", entry_point)
         tests = _pick_value(record, task.get("tests_field"), DEFAULT_TEST_FIELDS)
+        test_type = _pick_value(record, task.get("test_type_field"), DEFAULT_TEST_TYPE_FIELDS)
+        test_type = task.get("test_type", test_type)
+        timeout_seconds = _pick_value(record, task.get("timeout_field"), DEFAULT_TIMEOUT_FIELDS)
+        timeout_seconds = task.get("timeout_seconds", task.get("code_timeout_seconds", timeout_seconds))
         expected_substrings = _pick_value(
             record,
             task.get("expected_substrings_field"),
@@ -218,6 +230,10 @@ def _load_task_samples(task, split="train"):
             item["entry_point"] = _stringify_field(entry_point)
         if tests is not None:
             item["tests"] = tests
+        if test_type is not None:
+            item["test_type"] = _stringify_field(test_type)
+        if timeout_seconds is not None:
+            item["timeout_seconds"] = float(timeout_seconds)
         if expected_substrings is not None:
             item["expected_substrings"] = _normalize_list_field(expected_substrings)
         if starter_code is not None:
