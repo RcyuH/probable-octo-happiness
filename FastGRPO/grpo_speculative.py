@@ -204,6 +204,10 @@ if torch.cuda.is_available():
 
 if verification_capacity <= 0:
     raise ValueError("--verification_capacity must be positive.")
+if batch_size <= 0:
+    raise ValueError("--batch_size must be positive.")
+if repeated_generate_nums <= 0:
+    raise ValueError("--repeated_generate_nums must be positive.")
 if max_verification_num <= 1:
     raise ValueError("--max_verification_num must be greater than 1.")
 if max_draft_k <= 0:
@@ -214,6 +218,17 @@ if min_draft_token_length > max_draft_token_length:
     raise ValueError("--min_draft_token_length must be <= --max_draft_token_length.")
 if draft_token_length_c <= 0:
     raise ValueError("--draft_token_length_c must be positive.")
+if generation_backend == "speculative":
+    effective_generation_batch = batch_size * repeated_generate_nums
+    min_verification_capacity = 2 * effective_generation_batch
+    if verification_capacity < min_verification_capacity:
+        raise ValueError(
+            "--verification_capacity is too small for speculative generation: "
+            f"got {verification_capacity}, but --batch_size {batch_size} * "
+            f"--repeated_generate_nums {repeated_generate_nums} requires at least "
+            f"{min_verification_capacity} verification slots. Increase "
+            "--verification_capacity or reduce --batch_size/--repeated_generate_nums."
+        )
 if lora_r <= 0:
     raise ValueError("--lora_r must be positive.")
 if lora_alpha <= 0:

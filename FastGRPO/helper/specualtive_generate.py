@@ -24,9 +24,10 @@ import sys
 import torch
 from copy import deepcopy,copy
 import threading
-import math
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+
+from helper.speculative_hyperparameters import get_adaptive_hyperparameters
 
 
 total_target_time=0
@@ -114,23 +115,6 @@ def sampling(
     return sampled_tokens
 
 
-
-def get_adaptive_hyperparameters(bsz, verification_capacity,
-                                max_draft_token_length, max_draft_k, max_verification_num,
-                                min_draft_token_length, draft_token_length_c):
-    
-    verification_num = min(math.floor(verification_capacity/bsz), max_verification_num)
-
-    draft_token_length = min(math.floor(math.log2(verification_num/draft_token_length_c)), max_draft_token_length)
-    draft_token_length = max(draft_token_length, min_draft_token_length)
-    
-    draft_k = min(verification_num-1, max_draft_k)
-
-    draft_total_token = verification_num - 1
-    
-    
-    return draft_token_length, draft_k, draft_total_token
-    
 
 def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         do_sample=False, repeated_generate_nums=None,
