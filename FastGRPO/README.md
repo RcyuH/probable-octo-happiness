@@ -82,6 +82,11 @@ python grpo_speculative.py \
     --draft_accumulation_steps 1 \
     --target_lr 1e-6 \
     --draft_lr 1e-4 \
+    --lora_r 64 \
+    --lora_alpha 32 \
+    --lora_dropout 0.0 \
+    --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+    --lora_bias none \
     --is_train_draft True \
     --temperature 1.0 \
     --top_p 0.95 \
@@ -156,6 +161,12 @@ python grpo_speculative.py \
     --batch_size 4 \
     --num_epochs 1 \
     --repeated_generate_nums 8 \
+    --target_lr 1e-6 \
+    --lora_r 64 \
+    --lora_alpha 32 \
+    --lora_dropout 0.0 \
+    --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+    --lora_bias none \
     --verification_capacity 160 \
     --max_draft_token_length 5 \
     --min_draft_token_length 3 \
@@ -191,9 +202,22 @@ python grpo_speculative.py \
     --saved_statistics_dir <dir_to_save_generation_stats>
 ```
 
-The JSON logs include `generation_backend` and `task_metrics`, so compare
-`generate_time_cost`, `train_time_cost`, `mean_reward`, `average_acc_length`,
-and the per-task skip counts between these two runs.
+The target policy is trained with PEFT LoRA by default. `--target_lr` controls
+the LoRA adapter optimizer, while `--lora_r`, `--lora_alpha`,
+`--lora_dropout`, `--lora_target_modules`, and `--lora_bias` are passed directly
+to `peft.LoraConfig`. The defaults match the previous hard-coded setup:
+
+```bash
+--lora_r 64 \
+--lora_alpha 32 \
+--lora_dropout 0.0 \
+--lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+--lora_bias none
+```
+
+The JSON logs include `generation_backend`, `lora_config`, and `task_metrics`,
+so compare `generate_time_cost`, `train_time_cost`, `mean_reward`,
+`average_acc_length`, and the per-task skip counts between these two runs.
 
 TensorBoard scalar logs are enabled by default when the `tensorboard` package is
 installed. If `--tensorboard_log_dir` is omitted, event files are written to a

@@ -59,6 +59,13 @@ def str_to_bool(value):
     raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
 
 
+def comma_separated_list(value):
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    items = [item.strip() for item in str(value).split(",")]
+    return [item for item in items if item]
+
+
 parser = argparse.ArgumentParser(description="Training configuration")
 
 parser.add_argument('--model_dir',type=str)
@@ -83,6 +90,17 @@ parser.add_argument('--generation_backend', type=str, default="speculative",
                     choices=["speculative", "target"],
                     help="Use FastGRPO speculative generation or target-only generation baseline.")
 parser.add_argument('--load_lora_path',type=str,default="")
+parser.add_argument('--lora_r', type=int, default=64,
+                    help="LoRA rank for target policy training.")
+parser.add_argument('--lora_alpha', type=int, default=32,
+                    help="LoRA alpha for target policy training.")
+parser.add_argument('--lora_dropout', type=float, default=0.0,
+                    help="LoRA dropout for target policy training.")
+parser.add_argument('--lora_target_modules', type=comma_separated_list,
+                    default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                    help="Comma-separated target module names for LoRA adapters.")
+parser.add_argument('--lora_bias', type=str, default="none", choices=["none", "all", "lora_only"],
+                    help="Bias training mode passed to PEFT LoraConfig.")
 parser.add_argument('--batch_size',type=int,default=4)
 parser.add_argument('--version_name',type=str,default='normal')
 parser.add_argument('--num_epochs',type=int,default=10)
@@ -143,6 +161,11 @@ is_train_draft = args.is_train_draft
 model_type = args.model_type
 model_dir = args.model_dir
 adapter_path = args.adapter_path
+lora_r = args.lora_r
+lora_alpha = args.lora_alpha
+lora_dropout = args.lora_dropout
+lora_target_modules = args.lora_target_modules
+lora_bias = args.lora_bias
 temperature = args.temperature
 top_p = args.top_p
 version_name = args.version_name
@@ -165,6 +188,13 @@ speculative_config = {
     "max_verification_num": max_verification_num,
     "draft_token_length_c": draft_token_length_c,
 }
+lora_config_dict = {
+    "r": lora_r,
+    "lora_alpha": lora_alpha,
+    "lora_dropout": lora_dropout,
+    "target_modules": lora_target_modules,
+    "bias": lora_bias,
+}
 
 random.seed(seed)
 np.random.seed(seed)
@@ -184,6 +214,14 @@ if min_draft_token_length > max_draft_token_length:
     raise ValueError("--min_draft_token_length must be <= --max_draft_token_length.")
 if draft_token_length_c <= 0:
     raise ValueError("--draft_token_length_c must be positive.")
+if lora_r <= 0:
+    raise ValueError("--lora_r must be positive.")
+if lora_alpha <= 0:
+    raise ValueError("--lora_alpha must be positive.")
+if not 0 <= lora_dropout < 1:
+    raise ValueError("--lora_dropout must be in [0, 1).")
+if not lora_target_modules:
+    raise ValueError("--lora_target_modules must contain at least one module name.")
 
 if not os.path.exists(saved_model_dir):
     os.makedirs(saved_model_dir)
@@ -204,6 +242,9 @@ print(f"Train: epochs={num_epochs}, batch={batch_size}, "
       f"acc_steps={accumulation_steps}, draft_acc_steps={draft_accumulation_steps}")
 print(f"LR: target={target_lr}, draft={draft_lr} | "
       f"Seq: max_len={max_length}, max_tokens={max_training_token}, pad_gap={max_training_padding_gap}")
+print("LoRA: "
+      f"r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}, "
+      f"bias={lora_bias}, target_modules={','.join(lora_target_modules)}")
 print(f"Gen: temp={temperature}, top_p={top_p}"
       f"beta={beta}, epsilon={epsilon}")
 print("Speculative: "
@@ -267,10 +308,11 @@ for param in model.embed_tokens.parameters():
 
 lora_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,          
-    r=64,                           
-    lora_alpha=32,                
-    lora_dropout=0.0,              
-    target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
+    r=lora_r,
+    lora_alpha=lora_alpha,
+    lora_dropout=lora_dropout,
+    target_modules=lora_target_modules,
+    bias=lora_bias,
 )
 
 model.target_model = get_peft_model(model.target_model,lora_config)
@@ -1098,6 +1140,7 @@ for epoch in range(num_epochs):
             "batch_length_range": length_range,
             "batch_length_cv": round(length_cv, 4),
             "batch_average_acc_length": round(outputs['total_acc_length'] / outputs['total_decoded_token_num'], 4) if outputs['total_decoded_token_num'] else 0,
+            "lora_config": lora_config_dict,
             "speculative_config": speculative_config,
             "generation_perf": generation_perf,
             "reward_debug_batch": _summarize_reward_debug(batch_reward_debug),
@@ -1324,6 +1367,7 @@ for epoch in range(num_epochs):
                 "train_time_cost":round(batch_data['train_time_cost']/60,3),
                 "check_time_cost":round(batch_data['check_time_cost']/60,3),
                 "mean_reward":round(batch_data['mean_rewards']/used_items,4) if used_items else 0,
+                "lora_config": lora_config_dict,
                 "speculative_config": speculative_config,
                 "generation_perf": cumulative_generation_perf,
                 "reward_debug":_summarize_reward_debug(batch_data['reward_debug']),
