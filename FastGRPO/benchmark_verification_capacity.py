@@ -29,11 +29,13 @@ FALLBACK_PROMPTS = [
 
 def load_runtime_dependencies():
     global torch
+    global np
     global AutoConfig, AutoModelForCausalLM, AutoTokenizer
     global get_train_QAs, Model, DEFAULT_PROMPTS
     global load_multitask_QAs, normalize_single_task_QAs, render_messages
     global speculative_generate, get_adaptive_hyperparameters
 
+    import numpy as np
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -51,10 +53,20 @@ def load_runtime_dependencies():
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Sweep FastGRPO speculative verification_capacity values."
+        description="Measure FastGRPO target C_peak and optionally sweep verification_capacity."
     )
     parser.add_argument("--model_dir", required=True, help="Base target model directory/name.")
-    parser.add_argument("--adapter_path", required=True, help="Draft model checkpoint path.")
+    parser.add_argument(
+        "--adapter_path",
+        default="",
+        help="Draft model checkpoint path. Required for --benchmark_mode capacity/both.",
+    )
+    parser.add_argument(
+        "--benchmark_mode",
+        default="auto",
+        choices=["auto", "c_peak", "capacity", "both"],
+        help="auto runs c_peak only without --adapter_path, otherwise c_peak plus capacity sweep.",
+    )
     parser.add_argument(
         "--target_lora_path",
         default="",
@@ -63,8 +75,13 @@ def parse_args():
     parser.add_argument(
         "--capacities",
         default="64,96,128,160,192,256,320",
-        help="Comma list and/or ranges like '64,96,128:320:32'.",
+        help="Comma list/ranges like '64,96,128:320:32', or 'c_peak'/'auto' after C_peak measurement.",
     )
+    parser.add_argument("--c_peak_b_max", type=int, default=256)
+    parser.add_argument("--c_peak_step", type=int, default=8)
+    parser.add_argument("--c_peak_warmup", type=int, default=10)
+    parser.add_argument("--c_peak_repeat", type=int, default=30)
+    parser.add_argument("--c_peak_threshold", type=float, default=0.95)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--repeated_generate_nums", type=int, default=8)
     parser.add_argument("--num_batches", type=int, default=3)
@@ -123,7 +140,12 @@ def str_to_bool(value):
     raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}.")
 
 
-def parse_capacities(raw):
+def parse_capacities(raw, c_peak=None):
+    if str(raw).strip().lower() in {"auto", "c_peak"}:
+        if c_peak is None:
+            return None
+        return [int(c_peak)]
+
     values = []
     for part in raw.split(","):
         part = part.strip()
@@ -156,9 +178,9 @@ def resolve_dtype(name):
     }[name]
 
 
-def load_model_and_tokenizer(args):
+def load_target_model_and_tokenizer(args):
     if not torch.cuda.is_available():
-        raise RuntimeError("FastGRPO speculative_generate currently requires CUDA.")
+        raise RuntimeError("FastGRPO benchmarks currently require CUDA.")
 
     target_config = AutoConfig.from_pretrained(
         args.model_dir, trust_remote_code=args.trust_remote_code
@@ -171,6 +193,31 @@ def load_model_and_tokenizer(args):
     ).cuda()
     target_model.eval()
 
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_dir,
+        padding_side="left",
+        trust_remote_code=args.trust_remote_code,
+    )
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+    return target_model, tokenizer
+
+
+def maybe_load_target_lora(target_model, target_lora_path):
+    if not target_lora_path:
+        return target_model
+    from peft import PeftModel
+
+    target_model = PeftModel.from_pretrained(target_model, target_lora_path)
+    target_model.eval()
+    return target_model
+
+
+def build_fastgrpo_model(args, target_model):
+    if not args.adapter_path:
+        raise ValueError("--adapter_path is required for capacity sweep mode.")
+
     draft_config = AutoConfig.from_pretrained(
         args.model_dir, trust_remote_code=args.trust_remote_code
     )
@@ -180,24 +227,9 @@ def load_model_and_tokenizer(args):
         draft_config.torch_dtype = target_model.dtype
     model = Model(draft_config, target_model=target_model)
     model.load_model(args.adapter_path)
-
-    if args.target_lora_path:
-        from peft import PeftModel
-
-        model.target_model = PeftModel.from_pretrained(model.target_model, args.target_lora_path)
-
     model = model.cuda()
     model.eval()
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_dir,
-        padding_side="left",
-        trust_remote_code=args.trust_remote_code,
-    )
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
-    return model, tokenizer
+    return model
 
 
 def load_examples(args):
@@ -362,6 +394,114 @@ def generation_perf_metrics(outputs, token_ids_length, wall_time):
     }
 
 
+def resolve_benchmark_mode(args):
+    if args.benchmark_mode == "auto":
+        return "both" if args.adapter_path else "c_peak"
+    return args.benchmark_mode
+
+
+def measure_c_peak(
+    target_model,
+    tokenizer,
+    b_max=256,
+    step=8,
+    warmup=10,
+    repeat=30,
+    threshold=0.95,
+    device="cuda",
+):
+    if b_max <= 0:
+        raise ValueError("--c_peak_b_max must be positive.")
+    if step <= 0:
+        raise ValueError("--c_peak_step must be positive.")
+    if warmup < 0:
+        raise ValueError("--c_peak_warmup must be non-negative.")
+    if repeat <= 0:
+        raise ValueError("--c_peak_repeat must be positive.")
+    if not 0 < threshold <= 1:
+        raise ValueError("--c_peak_threshold must be in (0, 1].")
+
+    target_model.eval()
+    eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        eos_id = tokenizer.pad_token_id
+    if eos_id is None:
+        raise ValueError("Tokenizer must define eos_token_id or pad_token_id for C_peak measurement.")
+
+    rows = []
+    with torch.no_grad():
+        for batch_size in range(1, b_max + 1, step):
+            input_ids = torch.full(
+                (batch_size, 1),
+                eos_id,
+                dtype=torch.long,
+                device=device,
+            )
+            try:
+                torch.cuda.reset_peak_memory_stats()
+                for _ in range(warmup):
+                    _ = target_model(input_ids=input_ids)
+                torch.cuda.synchronize()
+
+                times = []
+                for _ in range(repeat):
+                    start = time.perf_counter()
+                    _ = target_model(input_ids=input_ids)
+                    torch.cuda.synchronize()
+                    times.append(time.perf_counter() - start)
+
+                latency = float(np.median(times))
+                throughput = batch_size / latency if latency else 0.0
+                row = {
+                    "batch_size": batch_size,
+                    "latency_seconds": latency,
+                    "throughput": throughput,
+                    "peak_memory_gb": torch.cuda.max_memory_allocated() / (1024 ** 3),
+                    "status": "ok",
+                }
+                rows.append(row)
+                print(
+                    f"C_peak probe B={batch_size}: "
+                    f"latency={latency:.6f}s throughput={throughput:.4f}"
+                )
+            except Exception as exc:
+                status = "oom" if is_oom_error(exc) else "error"
+                rows.append(
+                    {
+                        "batch_size": batch_size,
+                        "status": status,
+                        "error": str(exc),
+                    }
+                )
+                print(f"C_peak probe B={batch_size}: {status}: {exc}")
+                torch.cuda.empty_cache()
+                if status == "oom":
+                    break
+
+    ok_rows = [row for row in rows if row.get("status") == "ok"]
+    if not ok_rows:
+        raise RuntimeError("C_peak measurement did not complete any successful batch size.")
+
+    max_throughput = max(row["throughput"] for row in ok_rows)
+    threshold_throughput = threshold * max_throughput
+    c_peak = min(
+        row["batch_size"]
+        for row in ok_rows
+        if row["throughput"] >= threshold_throughput
+    )
+    summary = {
+        "c_peak": c_peak,
+        "max_throughput": max_throughput,
+        "threshold": threshold,
+        "threshold_throughput": threshold_throughput,
+        "b_max": b_max,
+        "step": step,
+        "warmup": warmup,
+        "repeat": repeat,
+    }
+    return c_peak, rows, summary
+
+
 def run_generation(model, tokenizer, tokenized, args, capacity, seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -504,13 +644,19 @@ def print_summary(summary_rows, best_row, recommend_metric):
 def main():
     args = parse_args()
     load_runtime_dependencies()
-    capacities = parse_capacities(args.capacities)
-    if args.num_batches <= 0:
-        raise ValueError("--num_batches must be positive.")
-    if args.warmup_batches < 0:
-        raise ValueError("--warmup_batches must be non-negative.")
-    if args.repeated_generate_nums <= 0:
-        raise ValueError("--repeated_generate_nums must be positive.")
+    benchmark_mode = resolve_benchmark_mode(args)
+    run_c_peak = benchmark_mode in {"c_peak", "both"}
+    run_capacity = benchmark_mode in {"capacity", "both"}
+
+    if run_capacity and not args.adapter_path:
+        raise ValueError("--adapter_path is required for --benchmark_mode capacity/both.")
+    if run_capacity:
+        if args.num_batches <= 0:
+            raise ValueError("--num_batches must be positive.")
+        if args.warmup_batches < 0:
+            raise ValueError("--warmup_batches must be non-negative.")
+        if args.repeated_generate_nums <= 0:
+            raise ValueError("--repeated_generate_nums must be positive.")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -518,12 +664,97 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = args.output_prefix or datetime.now().strftime("verification_capacity_%Y%m%d_%H%M%S")
+    c_peak_csv = output_dir / f"{run_id}_c_peak.csv"
+    c_peak_json = output_dir / f"{run_id}_c_peak.json"
     batch_jsonl = output_dir / f"{run_id}_batches.jsonl"
     summary_csv = output_dir / f"{run_id}_summary.csv"
     summary_json = output_dir / f"{run_id}_summary.json"
 
     print("Loading model and tokenizer...")
-    model, tokenizer = load_model_and_tokenizer(args)
+    target_model, tokenizer = load_target_model_and_tokenizer(args)
+    model = None
+    target_for_c_peak = target_model
+    defer_c_peak_until_after_capacity_model = run_c_peak and run_capacity and bool(args.target_lora_path)
+    if run_c_peak and not defer_c_peak_until_after_capacity_model:
+        target_for_c_peak = maybe_load_target_lora(target_model, args.target_lora_path)
+
+    c_peak = None
+    c_peak_summary = None
+    if run_c_peak and not defer_c_peak_until_after_capacity_model:
+        print(
+            "\nMeasuring C_peak with target forward passes "
+            f"(b_max={args.c_peak_b_max}, step={args.c_peak_step}, "
+            f"warmup={args.c_peak_warmup}, repeat={args.c_peak_repeat})..."
+        )
+        c_peak, c_peak_rows, c_peak_summary = measure_c_peak(
+            target_for_c_peak,
+            tokenizer,
+            b_max=args.c_peak_b_max,
+            step=args.c_peak_step,
+            warmup=args.c_peak_warmup,
+            repeat=args.c_peak_repeat,
+            threshold=args.c_peak_threshold,
+            device="cuda",
+        )
+        c_peak_payload = {
+            "args": vars(args),
+            "benchmark_mode": benchmark_mode,
+            "summary": c_peak_summary,
+            "results": c_peak_rows,
+        }
+        write_csv(c_peak_csv, c_peak_rows)
+        c_peak_json.write_text(json.dumps(c_peak_payload, indent=2, sort_keys=True), encoding="utf-8")
+        print(
+            f"\nC_peak={c_peak} "
+            f"(max throughput={c_peak_summary['max_throughput']:.4f}, "
+            f"threshold={args.c_peak_threshold:.2f})"
+        )
+        print(f"Wrote C_peak CSV:  {c_peak_csv}")
+        print(f"Wrote C_peak JSON: {c_peak_json}")
+
+    if not run_capacity:
+        return
+
+    model = build_fastgrpo_model(args, target_model)
+    if args.target_lora_path:
+        model.target_model = maybe_load_target_lora(model.target_model, args.target_lora_path)
+
+    if defer_c_peak_until_after_capacity_model:
+        print(
+            "\nMeasuring C_peak with target forward passes "
+            f"(b_max={args.c_peak_b_max}, step={args.c_peak_step}, "
+            f"warmup={args.c_peak_warmup}, repeat={args.c_peak_repeat})..."
+        )
+        c_peak, c_peak_rows, c_peak_summary = measure_c_peak(
+            model.target_model,
+            tokenizer,
+            b_max=args.c_peak_b_max,
+            step=args.c_peak_step,
+            warmup=args.c_peak_warmup,
+            repeat=args.c_peak_repeat,
+            threshold=args.c_peak_threshold,
+            device="cuda",
+        )
+        c_peak_payload = {
+            "args": vars(args),
+            "benchmark_mode": benchmark_mode,
+            "summary": c_peak_summary,
+            "results": c_peak_rows,
+        }
+        write_csv(c_peak_csv, c_peak_rows)
+        c_peak_json.write_text(json.dumps(c_peak_payload, indent=2, sort_keys=True), encoding="utf-8")
+        print(
+            f"\nC_peak={c_peak} "
+            f"(max throughput={c_peak_summary['max_throughput']:.4f}, "
+            f"threshold={args.c_peak_threshold:.2f})"
+        )
+        print(f"Wrote C_peak CSV:  {c_peak_csv}")
+        print(f"Wrote C_peak JSON: {c_peak_json}")
+
+    capacities = parse_capacities(args.capacities, c_peak=c_peak)
+    if capacities is None:
+        raise ValueError("--capacities auto/c_peak requires --benchmark_mode both or c_peak measurement.")
+
     examples = load_examples(args)
     if not examples:
         raise ValueError("No benchmark examples were loaded.")
@@ -656,7 +887,9 @@ def main():
         "recommended_capacity": best_row["capacity"] if best_row else None,
         "recommend_metric": args.recommend_metric,
         "best_row": best_row,
+        "c_peak": c_peak_summary,
         "args": vars(args),
+        "benchmark_mode": benchmark_mode,
         "summary": summary_rows,
     }
     summary_json.write_text(json.dumps(summary_payload, indent=2, sort_keys=True), encoding="utf-8")

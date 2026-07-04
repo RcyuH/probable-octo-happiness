@@ -305,12 +305,30 @@ active batch shares this capacity, so each sequence receives roughly
 `max_verification_num` is applied. Increase it only if the GPU has enough
 headroom and generation throughput improves.
 
-You can sweep candidate values with the benchmark helper:
+You can measure the target model's paper-style `C_peak` with the benchmark
+helper. It runs single-token target forward passes across batch sizes, computes
+`throughput = batch_size / median_latency`, and returns the smallest batch size
+within 95% of max throughput:
+
+```bash
+python3 FastGRPO/benchmark_verification_capacity.py \
+  --model_dir /path/to/base_model \
+  --benchmark_mode c_peak \
+  --c_peak_b_max 256 \
+  --c_peak_step 8 \
+  --c_peak_warmup 10 \
+  --c_peak_repeat 30 \
+  --output_dir FastGRPO/benchmark_results
+```
+
+To also run the older end-to-end speculative generation sweep, pass a draft
+checkpoint and use `both` mode:
 
 ```bash
 python3 FastGRPO/benchmark_verification_capacity.py \
   --model_dir /path/to/base_model \
   --adapter_path /path/to/draft_model.pt \
+  --benchmark_mode both \
   --capacities 64,96,128:320:32 \
   --batch_size 4 \
   --repeated_generate_nums 8 \
@@ -320,10 +338,12 @@ python3 FastGRPO/benchmark_verification_capacity.py \
   --output_dir FastGRPO/benchmark_results
 ```
 
-The benchmark writes per-batch JSONL plus summary CSV/JSON files and recommends
-the fastest successful capacity by generated tokens per second. Use
-`--task_config`, `--train_option`, `--prompt_file`, or repeated `--prompt` flags
-to benchmark prompts that match your real workload.
+The benchmark writes `*_c_peak.csv/json` for the forward-pass measurement. In
+`both`/`capacity` mode it also writes per-batch JSONL plus summary CSV/JSON files
+and recommends the fastest successful capacity by generated tokens per second.
+Use `--capacities c_peak` to run the generation sweep only at the measured
+`C_peak`, or use `--task_config`, `--train_option`, `--prompt_file`, or repeated
+`--prompt` flags to benchmark prompts that match your real workload.
 #### Output Control Parameters
 | Parameter | Type | Default | Description |
 |----------|------|---------|-------------|
