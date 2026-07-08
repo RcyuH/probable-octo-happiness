@@ -28,9 +28,11 @@ import pickle
 from tqdm.auto import tqdm
 from helper.multitask import (
     compute_multitask_reward_debug,
+    has_explicit_task_weights,
     load_multitask_QAs,
     normalize_single_task_QAs,
     render_messages,
+    TaskWeightedBatchSampler,
 )
 
 try:
@@ -1076,8 +1078,19 @@ class TrainDataCollator:
             'task_ids': task_ids,
         }
 
-dataloader=DataLoader(QAs,collate_fn=TrainDataCollator(tokenizer=tokenizer),num_workers=4,
-                    persistent_workers=True,batch_size=batch_size,shuffle=True,drop_last=False)
+if has_explicit_task_weights(QAs):
+    task_batch_sampler = TaskWeightedBatchSampler(
+        QAs,
+        batch_size=batch_size,
+        seed=seed,
+        drop_last=False,
+    )
+    print(f"Using task-weighted batch sampler: {task_batch_sampler.batch_task_counts()}")
+    dataloader=DataLoader(QAs,collate_fn=TrainDataCollator(tokenizer=tokenizer),num_workers=4,
+                        persistent_workers=True,batch_sampler=task_batch_sampler)
+else:
+    dataloader=DataLoader(QAs,collate_fn=TrainDataCollator(tokenizer=tokenizer),num_workers=4,
+                        persistent_workers=True,batch_size=batch_size,shuffle=True,drop_last=False)
 
 train_progress = tqdm(
     total=num_epochs * len(dataloader),

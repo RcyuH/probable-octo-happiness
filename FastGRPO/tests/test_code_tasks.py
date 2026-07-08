@@ -6,7 +6,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from helper.multitask import compute_multitask_reward_debug, load_multitask_QAs, render_messages
+from helper.multitask import (
+    TaskWeightedBatchSampler,
+    compute_multitask_reward_debug,
+    has_explicit_task_weights,
+    load_multitask_QAs,
+    render_messages,
+)
 from helper.rewards import compute_reward_from_example
 
 
@@ -183,6 +189,49 @@ class SolveTest(unittest.TestCase):
         self.assertEqual(samples[0]["reward_type"], "code_unit_test")
         self.assertEqual(samples[0]["test_type"], "unit")
         self.assertEqual(samples[0]["timeout_seconds"], 1.5)
+
+    def test_task_weighted_batch_sampler_uses_weights_per_batch(self):
+        config = {
+            "samples_per_epoch": 16,
+            "tasks": [
+                {
+                    "id": "math",
+                    "weight": 5,
+                    "prompt_type": "math",
+                    "records": [
+                        {"question": f"math {idx}", "answer": str(idx)}
+                        for idx in range(16)
+                    ],
+                },
+                {
+                    "id": "code",
+                    "weight": 3,
+                    "prompt_type": "code",
+                    "records": [
+                        {
+                            "prompt": f"code {idx}",
+                            "entry_point": "solve",
+                            "tests": "assert solve() == 1",
+                        }
+                        for idx in range(16)
+                    ],
+                },
+            ],
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as f:
+            json.dump(config, f)
+            f.flush()
+            samples = load_multitask_QAs(f.name, seed=123)
+
+        self.assertTrue(has_explicit_task_weights(samples))
+        sampler = TaskWeightedBatchSampler(samples, batch_size=8, seed=123)
+        batches = list(sampler)
+
+        self.assertEqual(len(batches), 2)
+        for batch in batches:
+            task_ids = [samples[idx]["task_id"] for idx in batch]
+            self.assertEqual(task_ids.count("math"), 5)
+            self.assertEqual(task_ids.count("code"), 3)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import csv
 import importlib
 import json
+import math
 import os
 import random
 from functools import lru_cache
@@ -238,6 +239,7 @@ def _load_task_samples(task, split="train"):
             "user_prompt_template": task.get("user_prompt_template", prompt_defaults["user_prompt_template"]),
             "format_weight": task.get("format_weight", 0.2),
             "task_weight": float(task.get("weight", 1.0)),
+            "_task_weight_explicit": "weight" in task,
             "metadata": metadata,
         }
         if language is not None:
@@ -381,6 +383,107 @@ def _mix_samples(samples_by_task, samples_per_epoch=None, seed=42):
 
     rng.shuffle(mixed)
     return mixed
+
+
+def has_explicit_task_weights(samples):
+    task_ids = {sample.get("task_id", "default") for sample in samples}
+    return len(task_ids) > 1 and any(sample.get("_task_weight_explicit") for sample in samples)
+
+
+class TaskWeightedBatchSampler:
+    """Yield batches whose task composition follows per-task weights."""
+
+    def __init__(self, samples, batch_size, seed=42, drop_last=False):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+        self.indices_by_task = {}
+        self.weights_by_task = {}
+
+        for idx, sample in enumerate(samples):
+            task_id = sample.get("task_id", "default")
+            self.indices_by_task.setdefault(task_id, []).append(idx)
+            self.weights_by_task.setdefault(task_id, float(sample.get("task_weight", 1.0)))
+
+        self.task_ids = [task_id for task_id, indices in self.indices_by_task.items() if indices]
+        if not self.task_ids:
+            raise ValueError("TaskWeightedBatchSampler requires at least one sample.")
+
+        self.weights = [max(0.0, self.weights_by_task.get(task_id, 1.0)) for task_id in self.task_ids]
+        if sum(self.weights) <= 0:
+            raise ValueError("Task weights must sum to a positive value.")
+
+        self.total_samples = len(samples)
+        if self.drop_last:
+            self.total_samples = (self.total_samples // self.batch_size) * self.batch_size
+
+    def __len__(self):
+        if self.total_samples == 0:
+            return 0
+        if self.drop_last:
+            return self.total_samples // self.batch_size
+        return math.ceil(self.total_samples / self.batch_size)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+
+        pools = {}
+        cursors = {}
+        for task_id in self.task_ids:
+            indices = list(self.indices_by_task[task_id])
+            rng.shuffle(indices)
+            pools[task_id] = indices
+            cursors[task_id] = 0
+
+        previous_counts = [0] * len(self.task_ids)
+        emitted = 0
+        while emitted < self.total_samples:
+            current_batch_size = min(self.batch_size, self.total_samples - emitted)
+            cumulative_counts = _weighted_counts(emitted + current_batch_size, self.weights)
+            batch_counts = [
+                cumulative_count - previous_count
+                for cumulative_count, previous_count in zip(cumulative_counts, previous_counts)
+            ]
+            previous_counts = cumulative_counts
+
+            batch = []
+            for task_id, count in zip(self.task_ids, batch_counts):
+                if count <= 0:
+                    continue
+                batch.extend(self._draw_indices(task_id, count, pools, cursors, rng))
+
+            rng.shuffle(batch)
+            emitted += len(batch)
+            if batch:
+                yield batch
+
+    def _draw_indices(self, task_id, count, pools, cursors, rng):
+        drawn = []
+        while len(drawn) < count:
+            pool = pools[task_id]
+            cursor = cursors[task_id]
+            remaining = len(pool) - cursor
+            need = count - len(drawn)
+
+            if remaining >= need:
+                drawn.extend(pool[cursor:cursor + need])
+                cursors[task_id] = cursor + need
+            else:
+                if remaining > 0:
+                    drawn.extend(pool[cursor:])
+                rng.shuffle(pool)
+                cursors[task_id] = 0
+
+        return drawn
+
+    def batch_task_counts(self, batch_size=None):
+        batch_size = self.batch_size if batch_size is None else int(batch_size)
+        return dict(zip(self.task_ids, _weighted_counts(batch_size, self.weights)))
 
 
 def _weighted_counts(total, weights):
