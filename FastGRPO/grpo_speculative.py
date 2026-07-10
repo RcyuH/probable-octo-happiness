@@ -139,6 +139,10 @@ parser.add_argument('--use_tensorboard', type=str_to_bool, nargs="?", const=True
                     help="Whether to write TensorBoard scalar logs.")
 parser.add_argument('--tensorboard_log_dir', type=str, default="",
                     help="TensorBoard log directory. Defaults to a tensorboard/ folder beside --log_file.")
+parser.add_argument('--reward_debug_sample_count', type=int, default=5,
+                    help="Number of failed reward examples to include in each generation log event.")
+parser.add_argument('--reward_debug_sample_chars', type=int, default=800,
+                    help="Maximum characters per prompt/completion/debug excerpt in reward debug samples.")
 args = parser.parse_args()
 num_epochs=args.num_epochs
 sample_num=args.sample_num
@@ -183,6 +187,8 @@ seed = args.seed
 generation_backend = args.generation_backend
 use_tensorboard = args.use_tensorboard
 tensorboard_log_dir = args.tensorboard_log_dir
+reward_debug_sample_count = max(0, args.reward_debug_sample_count)
+reward_debug_sample_chars = max(80, args.reward_debug_sample_chars)
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
@@ -790,6 +796,60 @@ def _summarize_reward_debug(stats):
     }
 
 
+def _clip_log_text(value, limit):
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...<truncated>"
+
+
+def _compact_messages_for_log(messages, limit):
+    if not messages:
+        return ""
+    pieces = []
+    for message in messages:
+        if not isinstance(message, dict):
+            pieces.append(str(message))
+            continue
+        role = message.get("role", "unknown")
+        content = message.get("content", "")
+        pieces.append(f"{role}: {content}")
+    return _clip_log_text("\n".join(pieces), limit)
+
+
+def _maybe_add_reward_debug_sample(samples, sample_limit, char_limit, task_id, repeat_index,
+                                   messages, completion, reward_detail):
+    if sample_limit <= 0 or len(samples) >= sample_limit:
+        return
+    reward = float(reward_detail.get("reward", 0.0))
+    error_type = reward_detail.get("error_type")
+    if reward > 0 and error_type in (None, "", "none"):
+        return
+
+    sample = {
+        "task_id": task_id,
+        "repeat_index": repeat_index,
+        "reward": reward,
+        "reward_type": reward_detail.get("reward_type"),
+        "error_type": error_type,
+        "prompt": _compact_messages_for_log(messages, char_limit),
+        "completion": _clip_log_text(completion, char_limit),
+    }
+    for key in (
+        "answer_parse_failed",
+        "answer_tag_fallback_used",
+        "answer_parsed",
+        "gold_parsed",
+        "verify_error",
+        "test_type",
+        "stderr_excerpt",
+        "stdout_excerpt",
+    ):
+        if key in reward_detail:
+            sample[key] = _clip_log_text(reward_detail.get(key), char_limit)
+    samples.append(sample)
+
+
 def _sanitize_tb_tag(value):
     return re.sub(r"[^A-Za-z0-9_./-]", "_", str(value)).strip("/") or "unknown"
 
@@ -805,6 +865,8 @@ _TB_TOP_LEVEL_KEYS = {
         "batch_ignore_due_incorrect",
         "batch_generate_time_cost",
         "batch_mean_length",
+        "batch_min_length",
+        "batch_max_length",
         "batch_length_stdev",
         "batch_length_range",
         "batch_length_cv",
@@ -1146,8 +1208,10 @@ for epoch in range(num_epochs):
         token_ids_length = [len(item) for item in outputs['generated_token_ids'] ]
         generation_perf = _generation_perf_metrics(outputs, token_ids_length)
         length_stdev = stdev(token_ids_length) if len(token_ids_length) > 1 else 0.0
-        length_range = max(token_ids_length) - min(token_ids_length)
         length_ave = mean(token_ids_length) if len(token_ids_length) > 0 else 0
+        length_min = min(token_ids_length) if token_ids_length else 0
+        length_max = max(token_ids_length) if token_ids_length else 0
+        length_range = length_max - length_min
         length_cv = length_stdev / length_ave if length_ave else 0
         batch_data['generate_length_list'].extend(token_ids_length)
         
@@ -1169,14 +1233,14 @@ for epoch in range(num_epochs):
             with open(f"{saved_statistics_dir}/{step}.pkl","wb") as f:
                 pickle.dump(batch_data['generate_length_list'],f)
         
-        generate_length=0
+        generate_length=length_ave
         repeat_count = repeated_generate_nums or 1
         batch_reward_debug = _new_reward_debug_stats()
+        reward_debug_samples = []
         batch_used_groups = 0
         batch_skip_due_correct = 0
         batch_skip_due_incorrect = 0
         for idx_batch in range(len(answers)):
-            generate_length += outputs['max_sequence_length']
             rewards=[]
             reward_details=[]
             new_messages=[]
@@ -1198,6 +1262,16 @@ for epoch in range(num_epochs):
                 
                 reward_detail=compute_multitask_reward_debug(decoded_sequence, reward_example)
                 reward=float(reward_detail["reward"])
+                _maybe_add_reward_debug_sample(
+                    reward_debug_samples,
+                    reward_debug_sample_count,
+                    reward_debug_sample_chars,
+                    task_id,
+                    idx_k,
+                    messages[idx_batch],
+                    decoded_sequence,
+                    reward_detail,
+                )
                 
                 rewards.append(reward)
                 reward_details.append(reward_detail)
@@ -1246,8 +1320,6 @@ for epoch in range(num_epochs):
             _record_group_decision(batch_data['reward_debug'], reward_details, "used")
             _record_group_decision(task_stat['reward_debug'], reward_details, "used")
             used_items+=1
-            
-        generate_length /= len(answers)
         
         batch_data['length_stdev'].append(length_stdev)
         batch_data['length_range'].append(length_range)
@@ -1288,12 +1360,15 @@ for epoch in range(num_epochs):
             "ignore_due_incorrect_cur_epoch": batch_data['ignore_due_incorrect'],
             "batch_generate_time_cost": round(outputs['total_time_cost'], 4),
             "batch_mean_length": round(generate_length, 3),
+            "batch_min_length": length_min,
+            "batch_max_length": length_max,
             "batch_length_stdev": round(length_stdev, 4),
             "batch_length_range": length_range,
             "batch_length_cv": round(length_cv, 4),
             "batch_average_acc_length": round(outputs['total_acc_length'] / outputs['total_decoded_token_num'], 4) if outputs['total_decoded_token_num'] else 0,
             "generation_perf": generation_perf,
             "reward_debug_batch": _summarize_reward_debug(batch_reward_debug),
+            "reward_debug_samples": reward_debug_samples,
             "reward_debug": _summarize_reward_debug(batch_data['reward_debug']),
             "task_metrics": _summarize_task_stats(batch_data['task_stats']),
         }

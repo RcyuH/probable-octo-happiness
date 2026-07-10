@@ -19,6 +19,33 @@ except ModuleNotFoundError:
     verify = None
 
 
+_ANSWER_TAG_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", flags=re.DOTALL | re.IGNORECASE)
+_BOXED_RE = re.compile(r"\\boxed\s*\{")
+_DEBUG_TEXT_LIMIT = 500
+
+
+def _clip_debug_text(value, limit=_DEBUG_TEXT_LIMIT):
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...<truncated>"
+
+
+def _completion_for_math_parse(completion):
+    text = str(completion or "")
+    if _BOXED_RE.search(text):
+        return text, False
+
+    match = _ANSWER_TAG_RE.search(text)
+    if not match:
+        return text, False
+
+    answer = match.group(1).strip()
+    if not answer:
+        return text, False
+    return f"{text}\n\\boxed{{{answer}}}", True
+
+
 def accuracy_reward_func(completions, solution, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
     if parse is None or verify is None or LatexExtractionConfig is None or NormalizationConfig is None:
@@ -34,8 +61,9 @@ def accuracy_reward_func(completions, solution, **kwargs):
             extraction_config=[LatexExtractionConfig()],
         )
         if len(gold_parsed) != 0:
+            content_for_parse, _ = _completion_for_math_parse(content)
             answer_parsed = parse(
-                content,
+                content_for_parse,
                 extraction_config=[
                     LatexExtractionConfig(
                         normalization_config=NormalizationConfig(
@@ -67,7 +95,7 @@ def accuracy_reward_func(completions, solution, **kwargs):
 
 
 def format_reward_func(completions, **kwargs):
-    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
+    """Reward function that checks for the closing think tag used by the training prompt."""
     
     def count_tags(text: str) -> float:
         count = 0.0
@@ -276,6 +304,8 @@ def code_unit_test_reward_details(completion, example):
         "error_type": result.error_type,
         "stdout_chars": len(result.stdout or ""),
         "stderr_chars": len(result.stderr or ""),
+        "stdout_excerpt": _clip_debug_text(result.stdout),
+        "stderr_excerpt": _clip_debug_text(result.stderr),
     })
     return detail
 
@@ -422,11 +452,18 @@ def _math_latex_reward_details(completion, solution, example):
             "error_type": "gold_parse_failed",
             "gold_parse_failed": True,
             "answer_parse_failed": False,
+            "completion_chars": len(str(completion or "")),
+            "gold_parsed_count": 0,
+            "answer_parsed_count": 0,
+            "gold_parsed": "",
+            "answer_parsed": "",
+            "answer_tag_fallback_used": False,
             "format_reward": float(format_reward_func([completion])[0]) if format_weight else 0.0,
         }
 
+    completion_for_parse, answer_tag_fallback_used = _completion_for_math_parse(completion)
     answer_parsed = parse(
-        completion,
+        completion_for_parse,
         extraction_config=[
             LatexExtractionConfig(
                 normalization_config=NormalizationConfig(
@@ -466,6 +503,12 @@ def _math_latex_reward_details(completion, solution, example):
         "error_type": error_type,
         "gold_parse_failed": False,
         "answer_parse_failed": len(answer_parsed) == 0,
+        "completion_chars": len(str(completion or "")),
+        "gold_parsed_count": len(gold_parsed),
+        "answer_parsed_count": len(answer_parsed),
+        "gold_parsed": _clip_debug_text(gold_parsed),
+        "answer_parsed": _clip_debug_text(answer_parsed),
+        "answer_tag_fallback_used": answer_tag_fallback_used,
         "answer_reward": answer_reward,
         "format_reward": format_reward,
         "verify_error": verify_error or "",

@@ -14,6 +14,7 @@ from helper.multitask import (
     render_messages,
 )
 from helper.rewards import compute_reward_from_example
+from helper.rewards import _completion_for_math_parse
 
 
 class CodeTaskTest(unittest.TestCase):
@@ -189,6 +190,38 @@ class SolveTest(unittest.TestCase):
         self.assertEqual(samples[0]["reward_type"], "code_unit_test")
         self.assertEqual(samples[0]["test_type"], "unit")
         self.assertEqual(samples[0]["timeout_seconds"], 1.5)
+
+    def test_messages_field_list_uses_first_chat_messages_candidate(self):
+        config = {
+            "samples_per_epoch": 1,
+            "tasks": [
+                {
+                    "id": "math_inline",
+                    "prompt_type": "math",
+                    "messages_field": ["prompt", "messages"],
+                    "records": [
+                        {
+                            "prompt": "Fallback prompt text.",
+                            "messages": [{"role": "user", "content": "Use this chat prompt."}],
+                            "answer": "1",
+                        }
+                    ],
+                }
+            ],
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as f:
+            json.dump(config, f)
+            f.flush()
+            samples = load_multitask_QAs(f.name, seed=123)
+
+        messages = render_messages(samples[0])
+        self.assertEqual(messages, [{"role": "user", "content": "Use this chat prompt."}])
+
+    def test_math_answer_tag_fallback_adds_boxed_answer(self):
+        completion, used_fallback = _completion_for_math_parse("<think>x</think><answer>42</answer>")
+
+        self.assertTrue(used_fallback)
+        self.assertIn("\\boxed{42}", completion)
 
     def test_task_weighted_batch_sampler_uses_weights_per_batch(self):
         config = {

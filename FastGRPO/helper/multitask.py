@@ -24,8 +24,7 @@ from helper.rewards import compute_reward_debug_from_example, compute_reward_fro
 MATH_SYSTEM_PROMPT = "You are a math problem assistant."
 MATH_USER_PROMPT = """Below is an instruction that describes a task, paired with an input that provides further context.
             Write a response that appropriately completes the request.
-            Your response should include your thought process enclosed within <think></think> tags
-            and the final answer enclosed within <answer></answer> tags (Just put a number between the tags).\n
+            Your response should include your thought process enclosed within <think></think> tags.\n
             ### Instruction:\n{instruction}\nPlease reason step by step, and put your final answer within \\boxed{{}}"""
 CODE_SYSTEM_PROMPT = "You are a careful programming assistant."
 CODE_USER_PROMPT = """Solve the following coding problem in {language}.
@@ -262,7 +261,7 @@ def _load_task_samples(task, split="train"):
         if task.get("pattern"):
             item["pattern"] = task["pattern"]
         if task.get("messages_field"):
-            messages = _get_nested(record, task["messages_field"])
+            messages = _pick_messages(record, task["messages_field"])
             if messages:
                 item["messages"] = messages
 
@@ -507,6 +506,47 @@ def _pick_value(record, configured_field, default_fields):
         if value is not None:
             return value
     return None
+
+
+def _pick_messages(record, configured_field):
+    fields = configured_field if configured_field is not None else ()
+    if isinstance(fields, str):
+        fields = (fields,)
+
+    for field in fields:
+        messages = _normalize_messages(_get_nested(record, field))
+        if messages:
+            return messages
+    return None
+
+
+def _normalize_messages(value):
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(value, dict):
+        if "messages" in value:
+            value = value["messages"]
+        elif "role" in value and "content" in value:
+            value = [value]
+        else:
+            return None
+    if not isinstance(value, (list, tuple)):
+        return None
+
+    messages = []
+    for item in value:
+        if not isinstance(item, dict) or "role" not in item or "content" not in item:
+            return None
+        messages.append({
+            "role": str(item["role"]),
+            "content": _stringify_field(item["content"]) or "",
+        })
+    return messages or None
 
 
 def _get_nested(record, field):
