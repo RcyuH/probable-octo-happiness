@@ -16,6 +16,7 @@ import numpy as np
 from tqdm import tqdm
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import datasets
+from datasets import load_dataset
 from transformers import get_cosine_schedule_with_warmup,get_scheduler
 from transformers import DynamicCache
 import json
@@ -73,11 +74,15 @@ if not os.path.exists(log_dir):
 
 print(version_name,os.getenv('CUDA_VISIBLE_DEVICES'))
 
-with open(dataset_dir,'r',encoding='utf-8') as f:
-    sharegpt_dataset=json.load(f)
-df=pd.DataFrame(sharegpt_dataset)
-dataset=datasets.Dataset.from_pandas(df)
-print(dataset)
+try:
+    with open(dataset_dir,'r',encoding='utf-8') as f:
+        sharegpt_dataset=json.load(f)
+    df=pd.DataFrame(sharegpt_dataset)
+    dataset=datasets.Dataset.from_pandas(df)
+    print(dataset)
+except:
+    dataset = load_dataset('json', data_files=dataset_dir, split='train')
+    print(dataset)
 
 config=AutoConfig.from_pretrained(model_dir)
 model_type=args.model_type
