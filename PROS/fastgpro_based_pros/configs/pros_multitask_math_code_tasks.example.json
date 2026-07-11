@@ -1,0 +1,69 @@
+{
+  "samples_per_epoch": 8,
+  "tasks": [
+    {
+      "id": "math_inline",
+      "weight": 0.5,
+      "prompt_type": "math",
+      "reward_type": "math_latex",
+      "prompt_field": "question",
+      "answer_field": "answer",
+      "answer_template": "\\boxed{{{answer}}}",
+      "format_weight": 0.2,
+      "records": [
+        {
+          "question": "What is 2 + 2?",
+          "answer": "4"
+        },
+        {
+          "question": "What is 7 - 3?",
+          "answer": "4"
+        },
+        {
+          "question": "What is 6 multiplied by 5?",
+          "answer": "30"
+        },
+        {
+          "question": "What is 12 divided by 3?",
+          "answer": "4"
+        }
+      ]
+    },
+    {
+      "id": "python_inline",
+      "weight": 0.5,
+      "prompt_type": "code",
+      "reward_type": "code_unit_test",
+      "prompt_field": "question",
+      "language": "python",
+      "entry_point_field": "entry_point",
+      "tests_field": "tests",
+      "test_type": "unit",
+      "timeout_seconds": 2.0,
+      "starter_code_field": "starter_code",
+      "records": [
+        {
+          "question": "Implement add(a, b) and return the sum of two integers.",
+          "entry_point": "add",
+          "tests": "assert add(2, 3) == 5\nassert add(-1, 1) == 0"
+        },
+        {
+          "question": "Implement is_even(n) and return True exactly when n is even.",
+          "entry_point": "is_even",
+          "tests": "def test_even_values():\n    assert is_even(0) is True\n    assert is_even(7) is False"
+        },
+        {
+          "question": "Implement square(n) and return n squared.",
+          "entry_point": "square",
+          "tests": "import unittest\n\nclass TestSquare(unittest.TestCase):\n    def test_values(self):\n        self.assertEqual(square(4), 16)\n        self.assertEqual(square(-3), 9)"
+        },
+        {
+          "question": "Implement clamp(value) using the supplied LIMIT constant, returning a value in [-LIMIT, LIMIT].",
+          "entry_point": "clamp",
+          "starter_code": "LIMIT = 10",
+          "tests": "assert clamp(20) == 10\nassert clamp(-15) == -10\nassert clamp(3) == 3"
+        }
+      ]
+    }
+  ]
+}

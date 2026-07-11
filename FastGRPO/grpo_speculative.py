@@ -141,10 +141,13 @@ parser.add_argument('--tensorboard_log_dir', type=str, default="",
                     help="TensorBoard log directory. Defaults to a tensorboard/ folder beside --log_file.")
 parser.add_argument('--reward_debug_sample_count', type=int, default=5,
                     help="Number of failed reward examples to include in each generation log event.")
-parser.add_argument('--reward_debug_sample_chars', type=int, default=800,
+parser.add_argument('--reward_debug_sample_chars', type=int, default=2048,
                     help="Maximum characters per prompt/completion/debug excerpt in reward debug samples.")
+parser.add_argument('--save_interval', type=int, default=200,
+                    help="Interval for saving model checkpoints.")
 args = parser.parse_args()
 num_epochs=args.num_epochs
+save_interval=args.save_interval
 sample_num=args.sample_num
 grpo_iteration_num=args.grpo_iteration_num
 repeated_generate_nums=args.repeated_generate_nums
@@ -188,7 +191,7 @@ generation_backend = args.generation_backend
 use_tensorboard = args.use_tensorboard
 tensorboard_log_dir = args.tensorboard_log_dir
 reward_debug_sample_count = max(0, args.reward_debug_sample_count)
-reward_debug_sample_chars = max(80, args.reward_debug_sample_chars)
+reward_debug_sample_chars = args.reward_debug_sample_chars
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
@@ -798,6 +801,8 @@ def _summarize_reward_debug(stats):
 
 def _clip_log_text(value, limit):
     text = str(value or "")
+    if limit is None:
+        return text
     if len(text) <= limit:
         return text
     return text[:limit] + "...<truncated>"
@@ -1625,7 +1630,7 @@ for epoch in range(num_epochs):
         batch_old_logps.clear()
         batch_ref_logps.clear()
 
-        if step%500==0 and step!=0:
+        if step%save_interval==0 and step!=0:
             if generation_backend == "speculative":
                 model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
             model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')

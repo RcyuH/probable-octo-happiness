@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -80,12 +80,19 @@ class ProsRolloutRecord:
 class ProsTreeEngine:
     """PROS tree engine with the PG posterior selector from the reference code."""
 
-    def __init__(self, original_data_len: int, config: ProsTreeConfig):
+    def __init__(
+        self,
+        original_data_len: int,
+        config: ProsTreeConfig,
+        root_task_ids: Optional[Sequence[str]] = None,
+        task_weights: Optional[Mapping[str, float]] = None,
+    ):
         if original_data_len <= 0:
             raise ValueError("original_data_len must be positive")
         self.config = config
         self.original_data_len = original_data_len
         self.rng = np.random.default_rng(config.random_seed)
+        self._configure_tasks(root_task_ids=root_task_ids, task_weights=task_weights)
 
         self.root = ProsTreeNode(item=-1, father_item=None, step_num=-1)
         self.item2node: Dict[int, ProsTreeNode] = {-1: self.root}
@@ -114,6 +121,51 @@ class ProsTreeEngine:
         self.select_num = np.zeros(original_data_len)
         self.father_select_num = np.zeros(original_data_len)
 
+    def _configure_tasks(
+        self,
+        root_task_ids: Optional[Sequence[str]],
+        task_weights: Optional[Mapping[str, float]],
+    ) -> None:
+        """Configure task metadata without storing it redundantly on child nodes.
+
+        Tree nodes retain their original checkpoint representation.  A child's
+        task is always resolved through its original root ancestor, which avoids
+        task identity drifting as partial-rollout descendants are created.
+        """
+
+        if root_task_ids is None:
+            normalized_task_ids = ["default"] * self.original_data_len
+        else:
+            if len(root_task_ids) != self.original_data_len:
+                raise ValueError(
+                    "root_task_ids must contain exactly one task id per root "
+                    f"example ({self.original_data_len}), got {len(root_task_ids)}"
+                )
+            normalized_task_ids = [str(task_id) for task_id in root_task_ids]
+
+        task_order = list(dict.fromkeys(normalized_task_ids))
+        explicit_weights = task_weights is not None
+        normalized_weights: Optional[Dict[str, float]] = None
+        if explicit_weights:
+            supplied_weights = {str(task_id): float(weight) for task_id, weight in task_weights.items()}
+            normalized_weights = {}
+            for task_id in task_order:
+                weight = supplied_weights.get(task_id, 1.0)
+                if not math.isfinite(weight) or weight < 0:
+                    raise ValueError(
+                        f"Task weight for {task_id!r} must be a finite non-negative number, got {weight!r}"
+                    )
+                normalized_weights[task_id] = weight
+            if sum(normalized_weights.values()) <= 0:
+                raise ValueError("Task weights must sum to a positive value.")
+
+        self.root_task_ids = normalized_task_ids
+        self.task_order = task_order
+        self.task_weights = normalized_weights
+        # Explicit weights only alter selection for a genuinely multi-task root
+        # pool.  This keeps legacy and single-task sampling exactly unchanged.
+        self.task_weighting_enabled = bool(explicit_weights and len(task_order) > 1)
+
     def __len__(self) -> int:
         return self.next_item
 
@@ -131,6 +183,8 @@ class ProsTreeEngine:
             "father_last_touch": self.father_last_touch,
             "select_num": self.select_num,
             "father_select_num": self.father_select_num,
+            "root_task_ids": self.root_task_ids,
+            "task_weights": self.task_weights,
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
@@ -140,12 +194,25 @@ class ProsTreeEngine:
         self.parent_selection_counts = state.get("parent_selection_counts", [0] * self.original_data_len)
         for key in ["psi", "variance", "s", "n", "last_touch", "father_last_touch", "select_num", "father_select_num"]:
             setattr(self, key, state[key])
+        # Older PROS checkpoints have no task metadata.  In that case retain
+        # the metadata supplied to this engine's constructor so they remain
+        # loadable in both legacy and newly configured multi-task runs.
+        if "root_task_ids" in state or "task_weights" in state:
+            self._configure_tasks(
+                root_task_ids=state.get("root_task_ids"),
+                task_weights=state.get("task_weights"),
+            )
 
     def get_node(self, item: int) -> ProsTreeNode:
         return self.item2node[item]
 
     def get_original_ancestor_item(self, item: int) -> int:
         return self.item2node[item].original_ancestor(self.item2node)
+
+    def get_task_id(self, item: int) -> str:
+        """Return the task of ``item``'s original root ancestor."""
+
+        return self.root_task_ids[self.get_original_ancestor_item(item)]
 
     def get_children_items(self, item: int) -> List[int]:
         return self.item2node[item].children_items
@@ -245,13 +312,25 @@ class ProsTreeEngine:
                 if best is None or score > best[0]:
                     best = (score, record, col_id)
         elif self.config.selector == "mix":
+            # Match the original PROS implementation: value filtering uses one
+            # 80th-percentile threshold over every valid token in the rollout
+            # group, not a separate percentile for each candidate response.
+            value_windows = [
+                values[start:end]
+                for _, _, start, end, _, values in candidates
+                if values is not None and values.size >= end
+            ]
+            if not value_windows:
+                return {"partial_lens": [], "partial_ratios": []}
+            flattened_values = np.concatenate(value_windows)
+            kth = max(int(flattened_values.size * 0.8), 1)
+            threshold = float(np.partition(flattened_values, kth - 1)[kth - 1])
             for _, record, start, end, entropies, values in candidates:
                 if values is None or values.size < end:
                     continue
                 window_values = values[start:end]
                 if window_values.size == 0:
                     continue
-                threshold = np.partition(window_values, max(int(window_values.size * 0.8) - 1, 0))[max(int(window_values.size * 0.8) - 1, 0)]
                 valid_positions = np.where(window_values > threshold)[0]
                 if valid_positions.size == 0:
                     continue
@@ -352,6 +431,13 @@ class ProsTreeEngine:
         return 200
 
     def select_batch(self, batch_size: int, step_num: int) -> Tuple[List[int], Dict[str, Any]]:
+        if self.task_weighting_enabled:
+            return self._select_task_weighted_batch(batch_size=batch_size, step_num=step_num)
+        return self._select_batch_legacy(batch_size=batch_size, step_num=step_num)
+
+    def _select_batch_legacy(self, batch_size: int, step_num: int) -> Tuple[List[int], Dict[str, Any]]:
+        """Original PROS selector, retained for unweighted and single-task runs."""
+
         thetas = self._sigmoid(self.psi)
         diverse_threshold = 3
         while diverse_threshold > 0:
@@ -379,9 +465,13 @@ class ProsTreeEngine:
         fallback_fill = 0
         if len(batch) < batch_size and self.config.allow_fallback_fill:
             for idx in range(self.original_data_len):
-                if idx in batch:
+                parent = self.get_original_ancestor_item(idx)
+                if parent in parent_set:
                     continue
+                parent_set.add(parent)
                 batch.append(idx)
+                self.select_num[idx] += 1
+                self.father_select_num[parent] += 1
                 fallback_fill += 1
                 if len(batch) == batch_size:
                     break
@@ -396,6 +486,164 @@ class ProsTreeEngine:
             "sampler/diverse_threshold": float(diverse_threshold),
             "sampler/fallback_fill": float(fallback_fill),
             "sampler/fixed_thetas": [[float(thetas[c]) for c in self.get_children_items(int(p))] for p in fixed_ids],
+        }
+        return batch, metrics
+
+    def _largest_remainder_task_quotas(self, batch_size: int) -> Dict[str, int]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if self.task_weights is None:
+            raise RuntimeError("Task quotas require explicit task weights.")
+
+        weights = [self.task_weights[task_id] for task_id in self.task_order]
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            # Constructor validation should make this unreachable, but keeping
+            # the guard here prevents invalid restored/mutated state from being
+            # sampled silently.
+            raise ValueError("Task weights must sum to a positive value.")
+
+        raw_counts = [batch_size * weight / total_weight for weight in weights]
+        counts = [int(math.floor(raw_count)) for raw_count in raw_counts]
+        remaining = batch_size - sum(counts)
+        remainder_order = sorted(
+            range(len(self.task_order)),
+            key=lambda index: (-(raw_counts[index] - counts[index]), index),
+        )
+        for index in remainder_order[:remaining]:
+            counts[index] += 1
+        return dict(zip(self.task_order, counts))
+
+    def _select_task_weighted_batch(self, batch_size: int, step_num: int) -> Tuple[List[int], Dict[str, Any]]:
+        """Select a deterministic weighted batch while preserving PROS diversity.
+
+        The strict pass applies the same recency threshold as the reference
+        sampler and ranks nodes by posterior uncertainty.  Fallback first tries
+        to satisfy each task's quota while relaxing recency, then deterministically
+        backfills any true task shortfall from other positive-weight tasks.  The
+        original-ancestor constraint is never relaxed.
+        """
+
+        quotas = self._largest_remainder_task_quotas(batch_size)
+        assert self.task_weights is not None  # Narrowed by weighted-mode setup.
+        positive_tasks = {
+            task_id for task_id in self.task_order if self.task_weights.get(task_id, 0.0) > 0
+        }
+
+        thetas = self._sigmoid(self.psi)
+        diverse_threshold = 3
+        positive_parent_mask = np.asarray(
+            [self.root_task_ids[parent] in positive_tasks for parent in range(self.original_data_len)],
+            dtype=bool,
+        )
+        while diverse_threshold > 0:
+            sufficiently_old = step_num - self.father_last_touch > diverse_threshold
+            if int(np.sum(sufficiently_old & positive_parent_mask)) < batch_size:
+                diverse_threshold -= 1
+            else:
+                break
+
+        # lexsort makes equal-uncertainty ties stable by node id, independent of
+        # NumPy's default argsort implementation.
+        errors = np.abs(thetas - 0.5)
+        ids = np.lexsort((np.arange(errors.size), errors))
+        ids_by_task: Dict[str, List[int]] = {task_id: [] for task_id in self.task_order}
+        for raw_idx in ids:
+            idx = int(raw_idx)
+            task_id = self.get_task_id(idx)
+            if task_id in positive_tasks:
+                ids_by_task[task_id].append(idx)
+
+        batch: List[int] = []
+        parent_set = set()
+        selected_counts = {task_id: 0 for task_id in self.task_order}
+        fallback_counts = {task_id: 0 for task_id in self.task_order}
+
+        def add_candidate(idx: int, *, fallback: bool) -> bool:
+            parent = self.get_original_ancestor_item(idx)
+            if parent in parent_set:
+                return False
+            task_id = self.root_task_ids[parent]
+            if task_id not in positive_tasks:
+                return False
+            parent_set.add(parent)
+            batch.append(idx)
+            selected_counts[task_id] += 1
+            if fallback:
+                fallback_counts[task_id] += 1
+            return True
+
+        # Strict quota pass: uncertainty ranking plus the original recency and
+        # original-ancestor diversity constraints.
+        for task_id in self.task_order:
+            target = quotas[task_id]
+            if target <= 0:
+                continue
+            for idx in ids_by_task[task_id]:
+                if selected_counts[task_id] >= target:
+                    break
+                parent = self.get_original_ancestor_item(idx)
+                if step_num - self.father_last_touch[parent] < diverse_threshold:
+                    continue
+                add_candidate(idx, fallback=False)
+
+        if self.config.allow_fallback_fill:
+            # Relax recency without relaxing task quotas or parent diversity.
+            for task_id in self.task_order:
+                target = quotas[task_id]
+                if target <= 0:
+                    continue
+                for idx in ids_by_task[task_id]:
+                    if selected_counts[task_id] >= target:
+                        break
+                    add_candidate(idx, fallback=True)
+
+        # Capture genuine per-task scarcity before another task backfills the
+        # missing slots.  These values therefore remain useful even when the
+        # final batch is full.
+        shortfall_counts = {
+            task_id: max(quotas[task_id] - selected_counts[task_id], 0)
+            for task_id in self.task_order
+        }
+
+        if len(batch) < batch_size and self.config.allow_fallback_fill:
+            # Cross-task backfill stays deterministic, uncertainty-ranked, and
+            # excludes zero-weight tasks.  Parent diversity remains mandatory.
+            for raw_idx in ids:
+                if len(batch) >= batch_size:
+                    break
+                add_candidate(int(raw_idx), fallback=True)
+
+        if len(batch) != batch_size:
+            raise ValueError(
+                f"Only {len(batch)} items collected for weighted batch size {batch_size}; "
+                f"task quotas={quotas}, task shortfalls={shortfall_counts}"
+            )
+
+        for idx in batch:
+            parent = self.get_original_ancestor_item(idx)
+            self.select_num[idx] += 1
+            self.father_select_num[parent] += 1
+
+        fixed_ids = np.arange(min(20, self.original_data_len))
+        fallback_fill = sum(fallback_counts.values())
+        quota_shortfall = sum(shortfall_counts.values())
+        metrics: Dict[str, Any] = {
+            "sampler/selected_thetas_mean": float(np.mean(thetas[batch])),
+            "sampler/selected_thetas_min": float(np.min(thetas[batch])),
+            "sampler/selected_thetas_max": float(np.max(thetas[batch])),
+            "sampler/diverse_threshold": float(diverse_threshold),
+            "sampler/fallback_fill": float(fallback_fill),
+            "sampler/fixed_thetas": [
+                [float(thetas[child]) for child in self.get_children_items(int(parent))]
+                for parent in fixed_ids
+            ],
+            "sampler/task_quotas": quotas,
+            "sampler/task_selected_counts": selected_counts,
+            "sampler/task_shortfall_counts": shortfall_counts,
+            "sampler/task_fallback_counts": fallback_counts,
+            "sampler/task_quota_shortfall": float(quota_shortfall),
+            "sampler/task_fallback_fill": float(fallback_fill),
         }
         return batch, metrics
 

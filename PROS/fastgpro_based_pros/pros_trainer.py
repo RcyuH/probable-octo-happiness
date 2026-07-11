@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import sys
@@ -10,14 +11,25 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from statistics import mean, stdev
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .pros_config import ProsConfig
+from .pros_logging import (
+    ProsEventLogger,
+    RewardDebugAggregator,
+    compute_generation_perf,
+    compute_length_metrics,
+    safe_div,
+)
 from .pros_loss import compute_gpg_advantages, compute_grpo_advantages, compute_policy_loss, gather_token_logps
 from .pros_tree import ProsRolloutRecord, ProsTreeConfig, ProsTreeEngine
+
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:  # pragma: no cover - exercised in minimal runtime environments.
+    tqdm = None
 
 
 @dataclass
@@ -51,6 +63,7 @@ class TrainingRecord:
     decoded_completion: str
     task_id: str
     reward_example: Dict[str, Any]
+    reward_detail: Dict[str, Any] = field(default_factory=dict)
     advantage: float = 0.0
     old_log_prob: Any = None
     ref_log_prob: Any = None
@@ -62,13 +75,26 @@ class TrainingRecord:
         return [1] * len(self.full_response_ids)
 
 
+@dataclass
+class RolloutBatch:
+    """All verified rollouts plus the subset eligible for actor optimization."""
+
+    all_records: List[TrainingRecord]
+    actor_records: List[TrainingRecord]
+    group_decisions: Dict[int, str]
+    generated_groups: int = 0
+    used_groups: int = 0
+    skipped_correct_groups: int = 0
+    skipped_incorrect_groups: int = 0
+    empty_completions: int = 0
+
+
 class ProsTrainer:
     """Orchestrates PROS training while reusing FastGRPO helpers."""
 
     def __init__(self, config: ProsConfig):
         self.cfg = config
-        if config.generation_backend not in {"speculative", "target"}:
-            raise ValueError(f"generation_backend must be 'speculative' or 'target', got {config.generation_backend!r}")
+        self.cfg.validate()
         self.repo_root = Path(__file__).resolve().parents[2]
         self.fastgrpo_root = self.repo_root / "FastGRPO"
         self._ensure_fastgrpo_importable()
@@ -81,11 +107,17 @@ class ProsTrainer:
         self._load_models()
         self.qas = self._load_training_examples()
         self.eval_qas = self._load_eval_examples()
-        self.tree = ProsTreeEngine(len(self.qas), self._tree_config())
+        root_task_ids, task_weights = self._tree_task_metadata(self.qas)
+        self.tree = ProsTreeEngine(
+            len(self.qas),
+            self._tree_config(),
+            root_task_ids=root_task_ids,
+            task_weights=task_weights,
+        )
         self.next_items, self.last_sampler_metrics = self.tree.select_batch(config.batch_size, step_num=0)
 
         self.optimizer_target = self.torch.optim.AdamW(
-            [p for p in self.model.target_model.parameters() if p.requires_grad],
+            self._trainable_target_parameters(),
             lr=config.target_lr,
         )
         self.optimizer_draft = (
@@ -96,53 +128,127 @@ class ProsTrainer:
         self.target_accumulated_steps = 0
         self.draft_accumulated_steps = 0
         self.global_step = 0
+        self.generation_attempt = 0
         self.used_groups = 0
         self.task_stats: Dict[str, Dict[str, float]] = {}
+        self.generation_totals: Dict[str, float] = {
+            "generation_time_sec": 0.0,
+            "generated_completion_tokens": 0.0,
+            "prefill_time_sec": 0.0,
+            "speculative_emitted_tokens": 0.0,
+            "speculative_accepted_draft_tokens": 0.0,
+            "speculative_verified_draft_tokens": 0.0,
+            "speculative_path_budget_tokens": 0.0,
+            "speculative_verification_rounds": 0.0,
+        }
         self.start_time = time.time()
 
         self._prepare_output_dirs()
         self.cfg.save()
+        self.event_logger = ProsEventLogger(
+            self.cfg.log_file,
+            use_tensorboard=self.cfg.use_tensorboard,
+            tensorboard_log_dir=self.cfg.tensorboard_log_dir,
+        )
+        self.reward_debug = RewardDebugAggregator(
+            sample_limit=self.cfg.reward_debug_sample_count,
+            char_limit=self.cfg.reward_debug_sample_chars,
+        )
+        self.progress = None
+        self.event_logger.log(
+            "config",
+            {
+                "config": self.cfg.to_dict(),
+                "generation_backend": self.cfg.generation_backend,
+                "lora_config": self._effective_lora_config(),
+                "speculative_config": self._effective_speculative_config(),
+                "tensorboard_enabled": self.event_logger.writer is not None,
+                "tensorboard_log_dir_effective": str(self.event_logger.tensorboard_log_dir),
+            },
+            epoch=0,
+            step=self.global_step,
+            global_step=self.global_step,
+            generation_attempt=self.generation_attempt,
+            generation_backend=self.cfg.generation_backend,
+        )
 
     def train(self) -> None:
         if self.cfg.dry_run:
             print(json.dumps({"dry_run": True, "config": self.cfg.to_dict()}, indent=2, sort_keys=True))
+            self.event_logger.close()
             return
 
-        for epoch in range(self.cfg.num_epochs):
-            if self.cfg.max_train_steps and self.global_step >= self.cfg.max_train_steps:
-                break
-            self._train_epoch(epoch)
+        attempts_per_epoch = max(1, math.ceil(len(self.qas) / self.cfg.batch_size))
+        total_attempts = self.cfg.num_epochs * attempts_per_epoch
+        if tqdm is not None:
+            self.progress = tqdm(total=total_attempts, desc="PROS training", dynamic_ncols=True, unit="batch")
+        else:
+            print("tqdm is not installed; continuing without a progress bar.")
 
-        self._save_checkpoint(self.global_step)
+        try:
+            for epoch in range(self.cfg.num_epochs):
+                if self.cfg.max_train_steps and self.global_step >= self.cfg.max_train_steps:
+                    break
+                self._train_epoch(epoch, attempts_per_epoch)
+            self._save_checkpoint(self.global_step)
+        finally:
+            if self.progress is not None:
+                self.progress.close()
+            self.event_logger.close()
 
-    def _train_epoch(self, epoch: int) -> None:
-        while True:
+    def _train_epoch(self, epoch: int, attempts_per_epoch: Optional[int] = None) -> None:
+        attempts_per_epoch = attempts_per_epoch or max(1, math.ceil(len(self.qas) / self.cfg.batch_size))
+        for _ in range(attempts_per_epoch):
             if self.cfg.max_train_steps and self.global_step >= self.cfg.max_train_steps:
                 return
+            self.generation_attempt += 1
+            self.reward_debug.reset_batch()
+            attempted_task_counts = self._task_counts_for_items(self.next_items)
             prompts = self._encode_selected_items(self.next_items)
             if not prompts:
-                self.next_items, self.last_sampler_metrics = self.tree.select_batch(self.cfg.batch_size, self.global_step)
+                self.next_items, self.last_sampler_metrics = self.tree.select_batch(
+                    self.cfg.batch_size,
+                    self.generation_attempt,
+                )
+                self._log_empty_generation(
+                    epoch,
+                    reason="no_valid_prompts",
+                    task_prompt_counts=attempted_task_counts,
+                )
+                self._update_progress(
+                    {
+                        "step": self.global_step,
+                        "skip": sum(attempted_task_counts.values()),
+                        "reward": 0.0,
+                        "tok/s": 0.0,
+                        "tasks": self._format_task_composition(attempted_task_counts),
+                    }
+                )
                 continue
 
             generation_start = time.time()
             outputs = self._generate(prompts)
-            records = self._build_training_records(prompts, outputs)
+            generation_time = time.time() - generation_start
+
+            reward_start = time.time()
+            rollout_batch = self._build_training_records(prompts, outputs)
+            reward_time = time.time() - reward_start
+
             if (
                 self.cfg.train_draft
                 and self.cfg.generation_backend == "speculative"
                 and self.optimizer_draft is not None
             ):
+                draft_start = time.time()
                 draft_metrics = self._train_draft_model(outputs, prompts)
+                draft_metrics["draft/train_time_sec"] = time.time() - draft_start
             else:
                 draft_metrics = {}
 
-            if not records:
-                self.next_items, self.last_sampler_metrics = self.tree.select_batch(self.cfg.batch_size, self.global_step)
-                continue
-
-            self._attach_response_statistics(records)
-            self._attach_advantages(records)
-            train_metrics = self._train_actor(records)
+            stats_start = time.time()
+            if rollout_batch.all_records:
+                self._attach_response_statistics(rollout_batch.all_records)
+            response_stats_time = time.time() - stats_start
 
             tree_records = [
                 ProsRolloutRecord(
@@ -154,41 +260,339 @@ class ProsTrainer:
                     entropies=record.entropies,
                     values=record.values or None,
                 )
-                for record in records
+                for record in rollout_batch.all_records
             ]
-            self.next_items, tree_metrics = self.tree.update_and_select(
-                tree_records,
-                step_num=self.global_step + 1,
-                batch_size=self.cfg.batch_size,
+            tree_start = time.time()
+            if tree_records:
+                self.next_items, tree_metrics = self.tree.update_and_select(
+                    tree_records,
+                    step_num=self.generation_attempt,
+                    batch_size=self.cfg.batch_size,
+                )
+            else:
+                self.next_items, tree_metrics = self.tree.select_batch(
+                    self.cfg.batch_size,
+                    step_num=self.generation_attempt,
+                )
+            self.last_sampler_metrics = tree_metrics
+            tree_time = time.time() - tree_start
+
+            generation_payload = self._build_generation_payload(
+                epoch=epoch,
+                prompts=prompts,
+                outputs=outputs,
+                rollout_batch=rollout_batch,
+                generation_time=generation_time,
+                reward_time=reward_time,
+                response_stats_time=response_stats_time,
+                tree_time=tree_time,
+                tree_metrics=tree_metrics,
+                draft_metrics=draft_metrics,
+            )
+            self._log_event(
+                "generation",
+                generation_payload,
+                epoch=epoch + 1,
+                step=self.global_step,
+                global_step=self.global_step,
+                generation_attempt=self.generation_attempt,
+                generation_backend=self.cfg.generation_backend,
             )
 
-            token_lengths = [len(record.generated_ids) for record in records]
-            reward_values = [record.reward for record in records]
-            metrics = {
-                "epoch": epoch + 1,
-                "step": self.global_step,
-                "used_groups": self.used_groups,
-                "records": len(records),
-                "elapsed_min": round((time.time() - self.start_time) / 60.0, 4),
-                "generate_time_sec": round(time.time() - generation_start, 4),
-                "reward_mean": float(np.mean(reward_values)) if reward_values else 0.0,
-                "reward_std": float(np.std(reward_values)) if reward_values else 0.0,
-                "generated_len_mean": float(np.mean(token_lengths)) if token_lengths else 0.0,
-                "generated_len_std": float(np.std(token_lengths)) if len(token_lengths) > 1 else 0.0,
-                "generation_backend": self.cfg.generation_backend,
-                "task_metrics": self._summarize_task_stats(),
-                **self.last_sampler_metrics,
-                **tree_metrics,
-                **train_metrics,
-                **draft_metrics,
-            }
-            if self.cfg.eval_freq > 0 and self.eval_qas and (self.global_step + 1) % self.cfg.eval_freq == 0:
-                metrics.update(self._evaluate())
-            self._log(metrics)
+            train_metrics: Dict[str, Any] = {}
+            if rollout_batch.actor_records:
+                self._attach_advantages(rollout_batch.actor_records)
+                actor_start = time.time()
+                train_metrics = self._train_actor(rollout_batch.actor_records)
+                train_metrics["actor/train_time_sec"] = time.time() - actor_start
+                self.global_step += 1
+                train_payload = {
+                    "used_groups": self.used_groups,
+                    "actor_records": len(rollout_batch.actor_records),
+                    "elapsed_min": round((time.time() - self.start_time) / 60.0, 4),
+                    "generation_perf": self._cumulative_generation_perf(),
+                    "task_metrics": self._summarize_task_stats(),
+                    "reward_debug": self.reward_debug.snapshot(),
+                    "lora_config": self._effective_lora_config(),
+                    "speculative_config": self._effective_speculative_config(),
+                    **tree_metrics,
+                    **train_metrics,
+                    **draft_metrics,
+                }
+                self._log_event(
+                    "train",
+                    train_payload,
+                    epoch=epoch + 1,
+                    step=self.global_step,
+                    global_step=self.global_step,
+                    generation_attempt=self.generation_attempt,
+                    generation_backend=self.cfg.generation_backend,
+                )
 
-            self.global_step += 1
-            if self.cfg.save_freq > 0 and self.global_step % self.cfg.save_freq == 0:
-                self._save_checkpoint(self.global_step)
+                if self.cfg.eval_freq > 0 and self.eval_qas and self.global_step % self.cfg.eval_freq == 0:
+                    eval_metrics = self._evaluate()
+                    self._log_event(
+                        "eval",
+                        eval_metrics,
+                        epoch=epoch + 1,
+                        step=self.global_step,
+                        global_step=self.global_step,
+                        generation_attempt=self.generation_attempt,
+                        generation_backend=self.cfg.generation_backend,
+                    )
+                if self.cfg.save_freq > 0 and self.global_step % self.cfg.save_freq == 0:
+                    self._save_checkpoint(self.global_step)
+
+            self._update_progress(
+                {
+                    "step": self.global_step,
+                    "reward": generation_payload.get("reward_mean", 0.0),
+                    "tok/s": generation_payload["generation_perf"].get("generated_tokens_per_second", 0.0),
+                    "skip": rollout_batch.skipped_correct_groups + rollout_batch.skipped_incorrect_groups,
+                    "tasks": self._format_task_composition(
+                        generation_payload.get("task_prompt_counts", {})
+                    ),
+                }
+            )
+
+    def _effective_lora_config(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self.cfg.use_lora),
+            "r": self.cfg.lora_r,
+            "lora_alpha": self.cfg.lora_alpha,
+            "lora_dropout": self.cfg.lora_dropout,
+            "target_modules": list(self.cfg.lora_target_modules),
+            "bias": self.cfg.lora_bias,
+            "load_lora_path": self.cfg.load_lora_path,
+        }
+
+    def _trainable_target_parameters(self) -> List[Any]:
+        """Return exactly the parameters the target optimizer may update."""
+
+        return [parameter for parameter in self.model.target_model.parameters() if parameter.requires_grad]
+
+    def _effective_speculative_config(self) -> Dict[str, Any]:
+        return {
+            "verification_capacity": self.cfg.verification_capacity,
+            "max_draft_token_length": self.cfg.max_draft_token_length,
+            "min_draft_token_length": self.cfg.min_draft_token_length,
+            "max_draft_k": self.cfg.max_draft_k,
+            "max_verification_num": self.cfg.max_verification_num,
+            "draft_token_length_c": self.cfg.draft_token_length_c,
+        }
+
+    def _tree_task_metadata(
+        self,
+        examples: Sequence[Dict[str, Any]],
+    ) -> Tuple[List[str], Optional[Dict[str, float]]]:
+        root_task_ids = [str(example.get("task_id", "default")) for example in examples]
+        if not self.has_explicit_task_weights(examples):
+            return root_task_ids, None
+
+        task_weights: Dict[str, float] = {}
+        for example, task_id in zip(examples, root_task_ids):
+            weight = float(example.get("task_weight", 1.0))
+            previous = task_weights.setdefault(task_id, weight)
+            if not math.isclose(previous, weight, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(f"Conflicting task weights for {task_id!r}: {previous} and {weight}")
+        return root_task_ids, task_weights
+
+    def _update_progress(self, values: Dict[str, Any]) -> None:
+        if self.progress is None:
+            return
+        self.progress.set_postfix(values)
+        self.progress.update(1)
+
+    @staticmethod
+    def _format_task_composition(task_counts: Dict[str, Any], max_chars: int = 80) -> str:
+        summary = ",".join(
+            f"{task_id}:{int(count)}" for task_id, count in sorted(task_counts.items())
+        )
+        if len(summary) <= max_chars:
+            return summary or "-"
+        return summary[: max(max_chars - 3, 0)] + "..."
+
+    def _task_counts_for_items(self, items: Sequence[int]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        get_task_id = getattr(self.tree, "get_task_id", None)
+        if not callable(get_task_id):
+            return counts
+        for item in items:
+            task_id = str(get_task_id(int(item)))
+            counts[task_id] = counts.get(task_id, 0) + 1
+        return counts
+
+    def _log_event(self, event: str, payload: Dict[str, Any], **context: Any) -> Dict[str, Any]:
+        record = self.event_logger.log(event, payload, **context)
+        if self.cfg.log_freq > 0 and self.generation_attempt % self.cfg.log_freq == 0:
+            perf = record.get("generation_perf") if isinstance(record.get("generation_perf"), dict) else {}
+            summary = {
+                "event": event,
+                "epoch": record.get("epoch"),
+                "step": record.get("step"),
+                "generation_attempt": record.get("generation_attempt"),
+                "reward_mean": record.get("reward_mean", record.get("eval/reward_mean")),
+                "generated_tokens_per_second": perf.get("generated_tokens_per_second"),
+                "actor_loss": record.get("actor/loss"),
+            }
+            print(json.dumps({key: value for key, value in summary.items() if value is not None}, sort_keys=True))
+        return record
+
+    def _log_empty_generation(
+        self,
+        epoch: int,
+        *,
+        reason: str,
+        task_prompt_counts: Optional[Dict[str, int]] = None,
+    ) -> None:
+        outputs = {
+            "total_time_cost": 0.0,
+            "target_time_cost": 0.0,
+            "draft_time_cost": 0.0,
+            "check_time_cost": 0.0,
+        }
+        payload = {
+            "reason": reason,
+            "batch_prompt_count": 0,
+            "batch_completion_count": 0,
+            "generated_group_count": 0,
+            "batch_used_group_count": 0,
+            "batch_ignore_due_correct": 0,
+            "batch_ignore_due_incorrect": 0,
+            "empty_completion_count": 0,
+            "actor_eligible_completion_count": 0,
+            "task_prompt_counts": dict(task_prompt_counts or {}),
+            "task_completion_counts": {},
+            "generation_perf": compute_generation_perf(
+                outputs,
+                [],
+                generation_time_sec=0.0,
+                generation_backend=self.cfg.generation_backend,
+            ),
+            "task_metrics": self._summarize_task_stats(),
+            "phase_timing": {
+                "generation_time_sec": 0.0,
+                "reward_time_sec": 0.0,
+                "draft_train_time_sec": 0.0,
+                "response_statistics_time_sec": 0.0,
+                "tree_update_time_sec": 0.0,
+            },
+            "lora_config": self._effective_lora_config(),
+            "speculative_config": self._effective_speculative_config(),
+            **compute_length_metrics([], [], []),
+            **self.reward_debug.as_payload(),
+            **self.last_sampler_metrics,
+        }
+        self._log_event(
+            "generation",
+            payload,
+            epoch=epoch + 1,
+            step=self.global_step,
+            global_step=self.global_step,
+            generation_attempt=self.generation_attempt,
+            generation_backend=self.cfg.generation_backend,
+        )
+
+    def _build_generation_payload(
+        self,
+        *,
+        epoch: int,
+        prompts: Sequence[EncodedPrompt],
+        outputs: Dict[str, Any],
+        rollout_batch: RolloutBatch,
+        generation_time: float,
+        reward_time: float,
+        response_stats_time: float,
+        tree_time: float,
+        tree_metrics: Dict[str, Any],
+        draft_metrics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        suffix_lengths = [len(record.generated_ids) for record in rollout_batch.all_records]
+        partial_lengths = [len(record.partial_rollout) for record in rollout_batch.all_records]
+        full_lengths = [len(record.full_response_ids) for record in rollout_batch.all_records]
+        rewards = [record.reward for record in rollout_batch.all_records]
+        generation_perf = compute_generation_perf(
+            outputs,
+            suffix_lengths,
+            generation_time_sec=generation_time,
+            generation_backend=self.cfg.generation_backend,
+        )
+        self._accumulate_generation_perf(generation_perf)
+        task_completion_counts: Dict[str, int] = {}
+        for record in rollout_batch.all_records:
+            task_completion_counts[record.task_id] = task_completion_counts.get(record.task_id, 0) + 1
+        task_prompt_counts: Dict[str, int] = {}
+        for prompt in prompts:
+            task_prompt_counts[prompt.task_id] = task_prompt_counts.get(prompt.task_id, 0) + 1
+
+        return {
+            "batch_prompt_count": len(prompts),
+            "batch_completion_count": len(rollout_batch.all_records),
+            "actor_eligible_completion_count": len(rollout_batch.actor_records),
+            "generated_group_count": rollout_batch.generated_groups,
+            "batch_used_group_count": rollout_batch.used_groups,
+            "batch_ignore_due_correct": rollout_batch.skipped_correct_groups,
+            "batch_ignore_due_incorrect": rollout_batch.skipped_incorrect_groups,
+            "empty_completion_count": rollout_batch.empty_completions,
+            "reward_mean": float(np.mean(rewards)) if rewards else 0.0,
+            "reward_std": float(np.std(rewards)) if rewards else 0.0,
+            "task_prompt_counts": task_prompt_counts,
+            "task_completion_counts": task_completion_counts,
+            "group_decisions": dict(rollout_batch.group_decisions),
+            "generation_perf": generation_perf,
+            "phase_timing": {
+                "generation_time_sec": generation_time,
+                "reward_time_sec": reward_time,
+                "draft_train_time_sec": float(draft_metrics.get("draft/train_time_sec", 0.0)),
+                "response_statistics_time_sec": response_stats_time,
+                "tree_update_time_sec": tree_time,
+            },
+            "task_metrics": self._summarize_task_stats(),
+            "lora_config": self._effective_lora_config(),
+            "speculative_config": self._effective_speculative_config(),
+            **compute_length_metrics(suffix_lengths, partial_lengths, full_lengths),
+            **self.reward_debug.as_payload(),
+            **tree_metrics,
+            **draft_metrics,
+        }
+
+    def _accumulate_generation_perf(self, perf: Dict[str, Any]) -> None:
+        for key in (
+            "generation_time_sec",
+            "generated_completion_tokens",
+            "target_time_sec",
+            "draft_time_sec",
+            "check_time_sec",
+            "prefill_time_sec",
+            "speculative_emitted_tokens",
+            "speculative_accepted_draft_tokens",
+            "speculative_verified_draft_tokens",
+            "speculative_path_budget_tokens",
+            "speculative_verification_rounds",
+        ):
+            self.generation_totals[key] = self.generation_totals.get(key, 0.0) + float(perf.get(key, 0.0) or 0.0)
+
+    def _cumulative_generation_perf(self) -> Dict[str, float]:
+        totals = dict(self.generation_totals)
+        generation_time = totals.get("generation_time_sec", 0.0)
+        rounds = totals.get("speculative_verification_rounds", 0.0)
+        accepted = totals.get("speculative_accepted_draft_tokens", 0.0)
+        emitted = totals.get("speculative_emitted_tokens", 0.0)
+        verified = totals.get("speculative_verified_draft_tokens", 0.0)
+        path_budget = totals.get("speculative_path_budget_tokens", 0.0)
+        return {
+            **totals,
+            "generated_tokens_per_second": safe_div(totals.get("generated_completion_tokens", 0.0), generation_time),
+            "target_time_ratio": safe_div(totals.get("target_time_sec", 0.0), generation_time),
+            "draft_time_ratio": safe_div(totals.get("draft_time_sec", 0.0), generation_time),
+            "check_time_ratio": safe_div(totals.get("check_time_sec", 0.0), generation_time),
+            "prefill_time_ratio": safe_div(totals.get("prefill_time_sec", 0.0), generation_time),
+            "speculative_avg_emitted_tokens_per_round": safe_div(emitted, rounds),
+            "speculative_avg_accepted_draft_tokens_per_round": safe_div(accepted, rounds),
+            "speculative_path_acceptance_rate": safe_div(accepted, path_budget),
+            "speculative_tree_acceptance_rate": safe_div(accepted, verified),
+            "speculative_verified_draft_tokens_per_round": safe_div(verified, rounds),
+        }
 
     def _ensure_fastgrpo_importable(self) -> None:
         fastgrpo_path = str(self.fastgrpo_root)
@@ -207,23 +611,22 @@ class ProsTrainer:
         from helper.get_QAs import get_test_QAs, get_train_QAs
         from helper.modeling_draft import Model
         from helper.multitask import (
-            compute_multitask_reward,
+            compute_multitask_reward_debug,
+            has_explicit_task_weights,
             load_multitask_QAs,
             normalize_single_task_QAs,
             render_messages,
         )
-        from helper.rewards import accuracy_reward_func, format_reward_func
         from helper.specualtive_generate import speculative_generate
 
         self.Model = Model
         self.get_train_QAs = get_train_QAs
         self.get_test_QAs = get_test_QAs
-        self.compute_multitask_reward = compute_multitask_reward
+        self.compute_multitask_reward_debug = compute_multitask_reward_debug
+        self.has_explicit_task_weights = has_explicit_task_weights
         self.load_multitask_QAs = load_multitask_QAs
         self.normalize_single_task_QAs = normalize_single_task_QAs
         self.render_messages = render_messages
-        self.accuracy_reward_func = accuracy_reward_func
-        self.format_reward_func = format_reward_func
         self.speculative_generate = speculative_generate
 
     def _load_training_examples(self) -> List[Dict[str, Any]]:
@@ -301,7 +704,8 @@ class ProsTrainer:
                 r=self.cfg.lora_r,
                 lora_alpha=self.cfg.lora_alpha,
                 lora_dropout=self.cfg.lora_dropout,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                target_modules=list(self.cfg.lora_target_modules),
+                bias=self.cfg.lora_bias,
             )
             self.model.target_model = get_peft_model(self.model.target_model, lora_config)
             if self.cfg.load_lora_path:
@@ -421,6 +825,9 @@ class ProsTrainer:
         )
 
     def _generate(self, prompts: Sequence[EncodedPrompt]) -> Dict[str, Any]:
+        self.model.target_model.eval()
+        if hasattr(self.model, "draft_model"):
+            self.model.draft_model.eval()
         input_ids, attention_mask = self._pad_left([prompt.input_ids for prompt in prompts])
         statistical_time = bool(self.torch.cuda.is_available())
         top_k = self.cfg.top_k if self.cfg.top_k > 0 else None
@@ -436,7 +843,13 @@ class ProsTrainer:
                 statistical_time=statistical_time,
                 max_length=self.cfg.max_length,
             )
-        with self.torch.inference_mode():
+        # Draft-training states are consumed by modules whose weights require
+        # gradients.  `inference_mode` tensors cannot always be saved for that
+        # backward pass, whereas `no_grad` avoids graph construction while
+        # returning ordinary tensors.  Keep the stronger mode when no draft
+        # update will consume the returned states.
+        generation_context = self.torch.no_grad if self.cfg.train_draft else self.torch.inference_mode
+        with generation_context():
             return self.speculative_generate(
                 model=self.model,
                 input_ids=input_ids,
@@ -448,6 +861,12 @@ class ProsTrainer:
                 temperature=self.cfg.temperature,
                 top_p=self.cfg.top_p,
                 top_k=top_k,
+                verification_capacity=self.cfg.verification_capacity,
+                max_draft_token_length=self.cfg.max_draft_token_length,
+                min_draft_token_length=self.cfg.min_draft_token_length,
+                max_draft_k=self.cfg.max_draft_k,
+                max_verification_num=self.cfg.max_verification_num,
+                draft_token_length_c=self.cfg.draft_token_length_c,
                 return_all_draft_input=self.cfg.train_draft,
                 statistical_time=statistical_time,
             )
@@ -502,11 +921,12 @@ class ProsTrainer:
             completion = sequence[prompt_length:].detach().cpu().tolist()
             trimmed = []
             for token in completion:
+                if self.tokenizer.eos_token_id is not None and token == self.tokenizer.eos_token_id:
+                    trimmed.append(token)
+                    break
                 if pad_token_id is not None and token == pad_token_id:
                     continue
                 trimmed.append(token)
-                if self.tokenizer.eos_token_id is not None and token == self.tokenizer.eos_token_id:
-                    break
             generated_token_ids.append(trimmed)
 
         total_decoded_token_num = sum(len(item) for item in generated_token_ids)
@@ -518,6 +938,11 @@ class ProsTrainer:
             "total_acc_length": total_decoded_token_num,
             "total_acc": 1.0,
             "total_decoded_token_num": max(total_decoded_token_num, 1),
+            "speculative_emitted_tokens": 0,
+            "speculative_accepted_draft_tokens": 0,
+            "speculative_verified_draft_tokens": 0,
+            "speculative_path_budget_tokens": 0,
+            "speculative_verification_rounds": 0,
             "total_time_cost": total_time_cost,
             "target_time_cost": target_time_cost,
             "draft_time_cost": 0.0,
@@ -534,8 +959,11 @@ class ProsTrainer:
                 "used_items": 0.0,
                 "reward_sum": 0.0,
                 "reward_count": 0.0,
+                "all_reward_sum": 0.0,
+                "all_reward_count": 0.0,
                 "generated_length_sum": 0.0,
                 "generated_completion_count": 0.0,
+                "empty_completion_count": 0.0,
                 "ignore_due_correct": 0.0,
                 "ignore_due_incorrect": 0.0,
             }
@@ -545,23 +973,34 @@ class ProsTrainer:
         summary: Dict[str, Dict[str, float]] = {}
         for task_id, stats in self.task_stats.items():
             reward_count = stats["reward_count"]
+            all_reward_count = stats["all_reward_count"]
             completion_count = stats["generated_completion_count"]
             summary[task_id] = {
                 "used_items": int(stats["used_items"]),
                 "mean_reward": round(stats["reward_sum"] / reward_count, 4) if reward_count else 0.0,
+                "mean_reward_all_completions": (
+                    round(stats["all_reward_sum"] / all_reward_count, 4) if all_reward_count else 0.0
+                ),
                 "mean_length": round(stats["generated_length_sum"] / completion_count, 3) if completion_count else 0.0,
                 "generated_completions": int(completion_count),
+                "empty_completions": int(stats["empty_completion_count"]),
                 "ignore_due_correct": int(stats["ignore_due_correct"]),
                 "ignore_due_incorrect": int(stats["ignore_due_incorrect"]),
             }
         return summary
 
-    def _evaluate(self) -> Dict[str, float]:
+    def _evaluate(self) -> Dict[str, Any]:
         eval_examples = self.eval_qas[: self.cfg.eval_samples]
         if not eval_examples:
             return {}
 
         self.model.target_model.eval()
+        if hasattr(self.model, "draft_model"):
+            self.model.draft_model.eval()
+        eval_reward_debug = RewardDebugAggregator(
+            sample_limit=self.cfg.reward_debug_sample_count,
+            char_limit=self.cfg.reward_debug_sample_chars,
+        )
         prompts = []
         for i, example in enumerate(eval_examples):
             prompt_ids = self._encode_base_prompt(example)
@@ -610,14 +1049,33 @@ class ProsTrainer:
                         temperature=self.cfg.temperature,
                         top_p=self.cfg.top_p,
                         top_k=top_k,
+                        verification_capacity=self.cfg.verification_capacity,
+                        max_draft_token_length=self.cfg.max_draft_token_length,
+                        min_draft_token_length=self.cfg.min_draft_token_length,
+                        max_draft_k=self.cfg.max_draft_k,
+                        max_verification_num=self.cfg.max_verification_num,
+                        draft_token_length_c=self.cfg.draft_token_length_c,
                         return_all_draft_input=False,
                         statistical_time=bool(self.torch.cuda.is_available()),
                     )
+            expected_outputs = len(batch_prompts)
+            if len(outputs.get("generated_token_ids", [])) != expected_outputs:
+                raise ValueError(
+                    "Generation output count mismatch during evaluation: "
+                    f"expected {expected_outputs}, got {len(outputs.get('generated_token_ids', []))}"
+                )
             for prompt, generated_ids in zip(batch_prompts, outputs["generated_token_ids"]):
                 completion = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-                reward = float(self.compute_multitask_reward(completion, prompt.example))
+                reward_detail = self.compute_multitask_reward_debug(completion, prompt.example)
+                reward = float(reward_detail["reward"])
+                eval_reward_debug.record_completion(
+                    reward_detail,
+                    task_id=prompt.task_id,
+                    prompt=self.render_messages(prompt.example),
+                    completion=completion,
+                )
                 rewards.append(reward)
-                accuracies.append(reward)
+                accuracies.append(float(bool(reward_detail.get("passed", reward >= 1.0))))
                 task_rewards.setdefault(prompt.task_id, []).append(reward)
         return {
             "eval/reward_mean": float(np.mean(rewards)) if rewards else 0.0,
@@ -626,22 +1084,42 @@ class ProsTrainer:
             "eval/task_reward_mean": {
                 task_id: float(np.mean(values)) if values else 0.0 for task_id, values in task_rewards.items()
             },
+            **eval_reward_debug.as_payload(),
         }
 
-    def _build_training_records(self, prompts: Sequence[EncodedPrompt], outputs: Dict[str, Any]) -> List[TrainingRecord]:
-        generated = outputs["generated_token_ids"]
+    def _build_training_records(self, prompts: Sequence[EncodedPrompt], outputs: Dict[str, Any]) -> RolloutBatch:
+        generated = list(outputs.get("generated_token_ids", []))
         prompt_records: Dict[int, List[TrainingRecord]] = {}
         repeat_count = self.cfg.repeated_generate_nums or 1
+        expected_outputs = len(prompts) * repeat_count
+        if len(generated) != expected_outputs:
+            raise ValueError(
+                "Generation output count mismatch: "
+                f"expected {expected_outputs} for {len(prompts)} prompts x {repeat_count} repeats, "
+                f"got {len(generated)}"
+            )
+
+        empty_completions = 0
 
         for idx, generated_ids in enumerate(generated):
             prompt_idx = idx // repeat_count
             prompt = prompts[prompt_idx]
             generated_ids = list(generated_ids)
             if not generated_ids:
-                continue
+                empty_completions += 1
             full_response_ids = prompt.partial_rollout + generated_ids
             decoded_completion = self.tokenizer.decode(full_response_ids, skip_special_tokens=True)
-            reward = float(self.compute_multitask_reward(decoded_completion, prompt.example))
+            reward_detail = self.compute_multitask_reward_debug(decoded_completion, prompt.example)
+            if not isinstance(reward_detail, dict) or "reward" not in reward_detail:
+                raise TypeError("compute_multitask_reward_debug must return a dict containing 'reward'")
+            reward = float(reward_detail["reward"])
+            self.reward_debug.record_completion(
+                reward_detail,
+                task_id=prompt.task_id,
+                prompt=self.render_messages(prompt.example),
+                completion=decoded_completion,
+                repeat_index=idx % repeat_count,
+            )
             full_input_ids = prompt.prompt_ids + full_response_ids
             new_token_mask = [0] * (len(prompt.prompt_ids) + len(prompt.partial_rollout)) + [1] * len(generated_ids)
             if len(full_input_ids) != len(new_token_mask):
@@ -660,28 +1138,76 @@ class ProsTrainer:
                     decoded_completion=decoded_completion,
                     task_id=prompt.task_id,
                     reward_example=prompt.example,
+                    reward_detail=dict(reward_detail),
                 )
             )
 
-        records: List[TrainingRecord] = []
-        for group in prompt_records.values():
+        all_records: List[TrainingRecord] = []
+        actor_records: List[TrainingRecord] = []
+        group_decisions: Dict[int, str] = {}
+        skipped_correct_groups = 0
+        skipped_incorrect_groups = 0
+        used_groups = 0
+        for item, group in prompt_records.items():
+            all_records.extend(group)
             rewards = [record.reward for record in group]
+            eligible_group = [record for record in group if record.generated_ids]
+            eligible_rewards = [record.reward for record in eligible_group]
             task_id = group[0].task_id if group else "default"
             task_stat = self._get_task_stat(task_id)
             task_stat["generated_length_sum"] += float(sum(len(record.generated_ids) for record in group))
             task_stat["generated_completion_count"] += float(len(group))
-            if self.cfg.drop_zero_std_groups and len(group) > 1 and float(np.std(rewards)) == 0.0:
-                if rewards and rewards[0] >= self.cfg.tree_score_threshold:
+            task_stat["empty_completion_count"] += float(sum(not record.generated_ids for record in group))
+            task_stat["all_reward_sum"] += float(sum(rewards))
+            task_stat["all_reward_count"] += float(len(rewards))
+            details = [record.reward_detail for record in group]
+            if not eligible_group:
+                if rewards and all(reward >= self.cfg.tree_score_threshold for reward in rewards):
+                    decision = "ignore_due_correct"
                     task_stat["ignore_due_correct"] += 1.0
+                    skipped_correct_groups += 1
                 else:
+                    decision = "ignore_due_incorrect"
                     task_stat["ignore_due_incorrect"] += 1.0
+                    skipped_incorrect_groups += 1
+                group_decisions[item] = decision
+                self.reward_debug.record_group_decision(decision, details, task_id=task_id)
                 continue
-            records.extend(group)
+            if (
+                self.cfg.drop_zero_std_groups
+                and len(eligible_group) > 1
+                and float(np.std(eligible_rewards)) == 0.0
+            ):
+                if eligible_rewards[0] >= self.cfg.tree_score_threshold:
+                    decision = "ignore_due_correct"
+                    task_stat["ignore_due_correct"] += 1.0
+                    skipped_correct_groups += 1
+                else:
+                    decision = "ignore_due_incorrect"
+                    task_stat["ignore_due_incorrect"] += 1.0
+                    skipped_incorrect_groups += 1
+                group_decisions[item] = decision
+                self.reward_debug.record_group_decision(decision, details, task_id=task_id)
+                continue
+            decision = "used"
+            group_decisions[item] = decision
+            actor_records.extend(eligible_group)
             task_stat["used_items"] += 1.0
-            task_stat["reward_sum"] += float(sum(rewards))
-            task_stat["reward_count"] += float(len(rewards))
+            task_stat["reward_sum"] += float(sum(eligible_rewards))
+            task_stat["reward_count"] += float(len(eligible_rewards))
             self.used_groups += 1
-        return records
+            used_groups += 1
+            self.reward_debug.record_group_decision(decision, details, task_id=task_id)
+        return RolloutBatch(
+            all_records=all_records,
+            actor_records=actor_records,
+            group_decisions=group_decisions,
+            generated_groups=len(prompt_records),
+            used_groups=used_groups,
+            skipped_correct_groups=skipped_correct_groups,
+            skipped_incorrect_groups=skipped_incorrect_groups,
+            empty_completions=empty_completions,
+        )
 
     def _attach_advantages(self, records: Sequence[TrainingRecord]) -> None:
         rewards = self.torch.tensor([record.reward for record in records], device=self.device, dtype=self.torch.float32)
@@ -750,20 +1276,21 @@ class ProsTrainer:
 
         outputs = self.model.target_model(input_ids=input_ids, attention_mask=attention_mask)
         log_prob = gather_token_logps(outputs.logits, input_ids)
+        needs_reference = self.cfg.objective == "fastgrpo" and self.cfg.beta > 0
 
         if iteration == 0:
             old_log_prob = log_prob.detach()
             for row, record in enumerate(records):
                 seq_len = len(record.full_input_ids) - 1
                 record.old_log_prob = old_log_prob[row, :seq_len].detach().cpu()
-            ref_log_prob = self._compute_ref_log_prob(input_ids, attention_mask) if self.cfg.beta > 0 else None
+            ref_log_prob = self._compute_ref_log_prob(input_ids, attention_mask) if needs_reference else None
             if ref_log_prob is not None:
                 for row, record in enumerate(records):
                     seq_len = len(record.full_input_ids) - 1
                     record.ref_log_prob = ref_log_prob[row, :seq_len].detach().cpu()
         else:
             old_log_prob = self._pad_logprob_records(records, "old_log_prob")
-            ref_log_prob = self._pad_logprob_records(records, "ref_log_prob") if self.cfg.beta > 0 else None
+            ref_log_prob = self._pad_logprob_records(records, "ref_log_prob") if needs_reference else None
 
         loss_stats = compute_policy_loss(
             objective=self.cfg.objective,
@@ -839,9 +1366,12 @@ class ProsTrainer:
             yield pack
 
     def _train_draft_model(self, outputs: Dict[str, Any], prompts: Sequence[EncodedPrompt]) -> Dict[str, float]:
-        states = outputs.get("all_draft_input_states") or []
-        ids = outputs.get("all_draft_input_ids") or []
-        if not states or not ids:
+        self.model.draft_model.train()
+        states = outputs.get("all_draft_input_states")
+        ids = outputs.get("all_draft_input_ids")
+        # Never boolean-coerce tensor-like containers: real or mocked tensors
+        # reject ambiguous truth-value checks when they contain multiple items.
+        if states is None or ids is None or len(states) == 0 or len(ids) == 0:
             return {"draft/loss1": 0.0, "draft/loss2": 0.0}
 
         repeat_count = self.cfg.repeated_generate_nums or 1
@@ -953,13 +1483,6 @@ class ProsTrainer:
             return {}
         keys = sorted({key for metric in metrics for key in metric})
         return {prefix + key: float(np.mean([metric[key] for metric in metrics if key in metric])) for key in keys}
-
-    def _log(self, metrics: Dict[str, Any]) -> None:
-        with open(self.cfg.log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(metrics, sort_keys=True) + "\n")
-        if self.cfg.log_freq > 0 and self.global_step % self.cfg.log_freq == 0:
-            printable = {k: v for k, v in metrics.items() if not isinstance(v, list)}
-            print(json.dumps(printable, sort_keys=True))
 
     def _save_checkpoint(self, step: int) -> None:
         target_dir = Path(self.cfg.saved_model_dir) / f"step{step}"
