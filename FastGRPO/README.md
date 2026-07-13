@@ -315,7 +315,7 @@ python3 FastGRPO/benchmark_verification_capacity.py \
   --model_dir /path/to/base_model \
   --benchmark_mode c_peak \
   --c_peak_b_max 256 \
-  --c_peak_step 8 \
+  --c_peak_b_values powers_of_two \
   --c_peak_warmup 10 \
   --c_peak_repeat 30 \
   --output_dir FastGRPO/benchmark_results
@@ -342,8 +342,11 @@ The benchmark writes `*_c_peak.csv/json` for the forward-pass measurement. In
 `both`/`capacity` mode it also writes per-batch JSONL plus summary CSV/JSON files
 and recommends the fastest successful capacity by generated tokens per second.
 Use `--capacities c_peak` to run the generation sweep only at the measured
-`C_peak`, or use `--task_config`, `--train_option`, `--prompt_file`, or repeated
-`--prompt` flags to benchmark prompts that match your real workload.
+`C_peak`. By default, `C_peak` probes powers of two up to `--c_peak_b_max`; use
+`--c_peak_b_values range --c_peak_step 8` for a linear scan, or pass an explicit
+list like `--c_peak_b_values 512,768,1024,1536,2048`. Use `--task_config`,
+`--train_option`, `--prompt_file`, or repeated `--prompt` flags to benchmark
+prompts that match your real workload.
 #### Output Control Parameters
 | Parameter | Type | Default | Description |
 |----------|------|---------|-------------|

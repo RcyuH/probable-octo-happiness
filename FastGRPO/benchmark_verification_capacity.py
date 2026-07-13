@@ -79,6 +79,14 @@ def parse_args():
     )
     parser.add_argument("--c_peak_b_max", type=int, default=256)
     parser.add_argument("--c_peak_step", type=int, default=8)
+    parser.add_argument(
+        "--c_peak_b_values",
+        default="powers_of_two",
+        help=(
+            "Batch sizes for C_peak. Use 'powers_of_two' (default), 'range', "
+            "or a comma list/range like '1,2,4,8,16' or '128:1024:128'."
+        ),
+    )
     parser.add_argument("--c_peak_warmup", type=int, default=10)
     parser.add_argument("--c_peak_repeat", type=int, default=30)
     parser.add_argument("--c_peak_threshold", type=float, default=0.95)
@@ -165,6 +173,54 @@ def parse_capacities(raw, c_peak=None):
     unique = sorted(set(values))
     if not unique:
         raise ValueError("--capacities must include at least one integer.")
+    return unique
+
+
+def parse_c_peak_batch_sizes(raw, b_max, step):
+    if b_max <= 0:
+        raise ValueError("--c_peak_b_max must be positive.")
+    if step <= 0:
+        raise ValueError("--c_peak_step must be positive.")
+
+    mode = str(raw).strip().lower()
+    if mode in {"", "powers_of_two", "power_of_two", "pow2", "power2"}:
+        values = []
+        batch_size = 1
+        while batch_size <= b_max:
+            values.append(batch_size)
+            batch_size *= 2
+        return values
+
+    if mode in {"range", "linear"}:
+        values = [1]
+        values.extend(range(step, b_max + 1, step))
+        return sorted(set(values))
+
+    values = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            pieces = [int(piece) for piece in part.split(":")]
+            if len(pieces) not in {2, 3}:
+                raise ValueError(f"Invalid C_peak batch range {part!r}; use start:end[:step].")
+            start, end = pieces[:2]
+            cur_step = pieces[2] if len(pieces) == 3 else step
+            if start <= 0 or end <= 0:
+                raise ValueError(f"C_peak batch sizes must be positive: {part!r}.")
+            if cur_step <= 0:
+                raise ValueError(f"C_peak batch range step must be positive: {part!r}.")
+            values.extend(range(start, end + 1, cur_step))
+        else:
+            value = int(part)
+            if value <= 0:
+                raise ValueError(f"C_peak batch sizes must be positive: {part!r}.")
+            values.append(value)
+
+    unique = sorted(set(value for value in values if value <= b_max))
+    if not unique:
+        raise ValueError("--c_peak_b_values produced no batch sizes <= --c_peak_b_max.")
     return unique
 
 
@@ -405,6 +461,7 @@ def measure_c_peak(
     tokenizer,
     b_max=256,
     step=8,
+    batch_sizes=None,
     warmup=10,
     repeat=30,
     threshold=0.95,
@@ -420,6 +477,8 @@ def measure_c_peak(
         raise ValueError("--c_peak_repeat must be positive.")
     if not 0 < threshold <= 1:
         raise ValueError("--c_peak_threshold must be in (0, 1].")
+    if batch_sizes is None:
+        batch_sizes = parse_c_peak_batch_sizes("powers_of_two", b_max, step)
 
     target_model.eval()
     eos_id = tokenizer.eos_token_id
@@ -430,7 +489,7 @@ def measure_c_peak(
 
     rows = []
     with torch.no_grad():
-        for batch_size in range(1, b_max + 1, step):
+        for batch_size in batch_sizes:
             input_ids = torch.full(
                 (batch_size, 1),
                 eos_id,
@@ -496,6 +555,7 @@ def measure_c_peak(
         "threshold_throughput": threshold_throughput,
         "b_max": b_max,
         "step": step,
+        "batch_sizes": list(batch_sizes),
         "warmup": warmup,
         "repeat": repeat,
     }
@@ -681,9 +741,14 @@ def main():
     c_peak = None
     c_peak_summary = None
     if run_c_peak and not defer_c_peak_until_after_capacity_model:
+        c_peak_batch_sizes = parse_c_peak_batch_sizes(
+            args.c_peak_b_values,
+            args.c_peak_b_max,
+            args.c_peak_step,
+        )
         print(
             "\nMeasuring C_peak with target forward passes "
-            f"(b_max={args.c_peak_b_max}, step={args.c_peak_step}, "
+            f"(batch_sizes={c_peak_batch_sizes}, "
             f"warmup={args.c_peak_warmup}, repeat={args.c_peak_repeat})..."
         )
         c_peak, c_peak_rows, c_peak_summary = measure_c_peak(
@@ -691,6 +756,7 @@ def main():
             tokenizer,
             b_max=args.c_peak_b_max,
             step=args.c_peak_step,
+            batch_sizes=c_peak_batch_sizes,
             warmup=args.c_peak_warmup,
             repeat=args.c_peak_repeat,
             threshold=args.c_peak_threshold,
@@ -720,9 +786,14 @@ def main():
         model.target_model = maybe_load_target_lora(model.target_model, args.target_lora_path)
 
     if defer_c_peak_until_after_capacity_model:
+        c_peak_batch_sizes = parse_c_peak_batch_sizes(
+            args.c_peak_b_values,
+            args.c_peak_b_max,
+            args.c_peak_step,
+        )
         print(
             "\nMeasuring C_peak with target forward passes "
-            f"(b_max={args.c_peak_b_max}, step={args.c_peak_step}, "
+            f"(batch_sizes={c_peak_batch_sizes}, "
             f"warmup={args.c_peak_warmup}, repeat={args.c_peak_repeat})..."
         )
         c_peak, c_peak_rows, c_peak_summary = measure_c_peak(
@@ -730,6 +801,7 @@ def main():
             tokenizer,
             b_max=args.c_peak_b_max,
             step=args.c_peak_step,
+            batch_sizes=c_peak_batch_sizes,
             warmup=args.c_peak_warmup,
             repeat=args.c_peak_repeat,
             threshold=args.c_peak_threshold,
